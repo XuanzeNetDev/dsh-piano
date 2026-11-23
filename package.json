@@ -1,0 +1,41 @@
+﻿{
+  "name": "dsh-piano-xz",
+  "version": "2.1.0",
+  "private": true,
+  "description": "璇泽 · DSH 电脑钢琴：标准 88 键钢琴，AI 用工具弹，网页右下角看得见也听得见",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "assets",
+    "scores",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  },
+  "os": ["win32", "darwin", "linux"],
+  "keywords": ["dsh", "dsh-plugin", "钢琴", "piano", "音乐"],
+  "license": "SEE LICENSE IN LICENSE"
+}

@@ -1,0 +1,33 @@
+﻿# ── 依赖与构建产物 ──
+node_modules/
+dist/
+*.pdb
+*.lib
+*.exp
+
+# ── 音源大文件：不进版本库 ──
+# Yamaha Upright 原始 SoundFont（169MB，超过 GitHub 100MB 单文件上限）
+# 需要时从 https://isamorphic.net 自行下载，再用 tools/extract-sf2.py 提取
+assets/yup/*.sf2
+assets/yup/*.zip
+# 旧的 mdaPiano 采样（已被 Yamaha 每键采样取代）
+assets/wav/
+assets/mdapiano-wavetable-raw.bin
+
+# ── 运行时产物 ──
+record/
+*.log
+# EXE 由 tools/PianoWindow.cs 现场编译，不入库
+tools/PianoWindow.exe
+tools/settings.json
+
+# ── 编辑器 ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 本地配置 ──
+.env
+.env.*

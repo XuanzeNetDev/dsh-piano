@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH Piano",
+    "description": "A standard 88-key computer piano in the bottom-right corner of the web GUI. The point is not that it makes sound, but that a score text file becomes a song: the model writes simple numbered notation with piano_score (both hands, octave dots, durations, dynamics), the plugin turns it into a timeline, and the browser plays it as piano. The keyboard is a real 88 keys with black keys at their true proportions on the key seams; the tone is synthesised from string physics, twelve partials decaying independently with velocity driving brightness, and no noise or reverb. You can also play it yourself with the mouse or the A-J keys."
+  }
+}

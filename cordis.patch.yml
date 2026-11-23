@@ -1,0 +1,15 @@
+# dsh-piano-xz 的 bundle patch —— 把「璇泽 DSH 钢琴」挂进 DSH 配置树
+#
+# 包名故意带 xz 后缀：npm 上已经有人占用了 dsh-piano（滑动钢琴，纯人手弹）。
+# 两者都叫 dsh-piano 的话，装载器行 id 会撞，后装的会把先装的顶掉。
+#
+#   id:     这一行的唯一标识（用户层可按 id 覆盖 config）
+#   name:   'dsh-piano-xz' 解析到本包入口 index.js（宿主半侧）
+#   config: leadMs（提前量，越大越稳、延迟越高）、maxVoices（同时发声上限）
+
+- insert:
+    - id: dsh-piano-xz
+      name: 'dsh-piano-xz'
+      config:
+        leadMs: 420
+        maxVoices: 48
