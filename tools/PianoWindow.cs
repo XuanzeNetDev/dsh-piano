@@ -384,7 +384,10 @@ namespace DshPiano
             Text = "DSH 钢琴";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.Manual;
-            ShowInTaskbar = true;
+            // 隐藏任务栏图标：钢琴是挂在 DSH 上的附属窗口，
+            // 在任务栏再占一个槽会让用户觉得"开了两个软件"。
+            // 窗口本身仍然可以置顶、可以被点击，只是不出现在任务栏。
+            ShowInTaskbar = false;
             BackColor = Color.FromArgb(11, 16, 23);
             KeyPreview = true;
 
@@ -1676,11 +1679,11 @@ namespace DshPiano
                     var logDir = Path.GetFullPath(Path.Combine(exeDir, "..", "record"));
                     Directory.CreateDirectory(logDir);
                     Audio.SetLog(Path.Combine(logDir, "audio.log"));
-                    // 优先用 mdaPiano 的波表（EOP 的原音源）；没有才退回 wav 采样
-                    var wtPath = Path.GetFullPath(Path.Combine(exeDir, "..", "assets", "mdapiano-wavetable-raw.bin"));
-                    var wtCount = Audio.LoadWaveTable(wtPath);
-                    Audio.Log("波表 " + wtCount + " samples  (" + wtPath + ")");
+                    // 音源只走 Yamaha 88 键每键采样。
+                    // 原来这里还会先加载 mdaPiano 的波表（EOP 的老音源），
+                    // 那套已经被取代，加载它只会在日志里留一行"波表 0 samples"。
                     var loaded = Audio.Load(wavDir);
+                    Audio.Log("音源 " + loaded);
                     Audio.Start();
                     Audio.StartRecord();   // --record 时把混音原样录下来（诊断用）
                 }
