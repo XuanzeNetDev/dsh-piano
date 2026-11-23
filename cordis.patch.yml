@@ -1,4 +1,4 @@
-# dsh-piano-xz 的 bundle patch —— 把「璇泽 DSH 钢琴」挂进 DSH 配置树
+# dsh-piano-xz 的 bundle patch —— 把「璇泽科技 DSH 钢琴」挂进 DSH 配置树
 #
 # 包名故意带 xz 后缀：npm 上已经有人占用了 dsh-piano（滑动钢琴，纯人手弹）。
 # 两者都叫 dsh-piano 的话，装载器行 id 会撞，后装的会把先装的顶掉。
