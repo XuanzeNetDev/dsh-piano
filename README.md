@@ -1,4 +1,4 @@
-# 璇泽 · DSH 钢琴（dsh-piano）
+﻿# 璇泽 · DSH 钢琴（dsh-piano）
 
 一台标准 **88 键**电脑钢琴，挂载在 DeepSeek Harness 上。
 
@@ -7,6 +7,53 @@ MIDI 文件）→ 插件解析成时间轴 → 按标准钢琴音色弹出来。
 
 ---
 
+## 快速开始（Windows）
+
+**三步**，不需要装 Node、不需要编译：
+
+```powershell
+git clone https://github.com/XuanzeNetDev/dsh-piano.git
+cd dsh-piano
+.\install.ps1          # 链接到 DSH profile + 检查音源 + 编译缺失的 EXE
+```
+
+然后重启 DSH，在插件列表里启用「DSH 钢琴」。网页右下角出现「● 钢琴」胶囊。
+
+### 依赖情况
+
+**零外部依赖**：
+
+| 需要 | 说明 |
+|---|---|
+| **Node.js** | DSH 自带，无需另装 |
+| **.NET Framework 4.x** | Windows 10/11 自带，用于跑 `tools/PianoWindow.exe` |
+| **Python 3** | **只有重新提取音源时**才需要；88 个 wav 已入库，正常使用不需要 |
+| **npm 包** | **无**（`dependencies` 和 `devDependencies` 都是空，只用 `node:` 内置模块） |
+
+### `install.ps1` 做了什么
+
+1. 找到 `%USERPROFILE%\.dsh\profiles\desktop`
+2. 把本仓库链接成 `node_modules\dsh-piano-xz`（用符号链接，改代码即时生效）
+3. 检查 `assets/yup/wav/` 里是否 88 个 wav
+4. 检查 `tools/PianoWindow.exe`，缺了就现场用 `csc.exe` 编译
+5. 全部就绪后提示重启 DSH
+
+### 如果 install.ps1 跑不了
+
+手动两步：
+
+```powershell
+# 1. 链接
+cmd /c mklink /D "%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-piano-xz" "<本仓库路径>"
+
+# 2. 编译播放器（如果 tools\PianoWindow.exe 不存在）
+cd tools
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /optimize+ `
+  /out:PianoWindow.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll `
+  PianoWindow.cs PianoAudio.cs
+```
+
+---
 ## 三个"标准"
 
 ### 1. 键盘是标准钢琴
@@ -232,3 +279,4 @@ Num8=C7  Num9=D7  Num/ =E7  Num* =F7  Num- =G7  Num+ =A7  Num. =B7
 - ❌ 任何有商业预期的使用
 
 完整条款见 [LICENSE](LICENSE)。
+
