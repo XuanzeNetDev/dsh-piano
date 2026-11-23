@@ -1,12 +1,6 @@
-﻿# 璇泽 · DSH 钢琴（dsh-piano）
+# 璇泽科技 · DSH 钢琴（dsh-piano）
 
 一台标准 **88 键**电脑钢琴，挂载在 DeepSeek Harness 上。
-
-![DSH 钢琴](docs/screenshot.png)
-
-<sub>钢琴吸附在 DSH 窗口顶部，键位与主界面一体；右上角收着调号、拍号、速度、吸附开关。</sub>
-
----
 
 **核心不是"能响"，是"能把一份乐谱变成一首歌"**：AI 写一份乐谱文本（或直接读一份
 MIDI 文件）→ 插件解析成时间轴 → 按标准钢琴音色弹出来。谱就是歌，文件就是作品。
@@ -272,7 +266,7 @@ Num8=C7  Num9=D7  Num/ =E7  Num* =F7  Num- =G7  Num+ =A7  Num. =B7
 |---|---|---|
 | **Yamaha Upright** SoundFont | Polyphone / isamorphic.net | 公有领域 |
 | **Salamander Grand Piano V3** | Alexander Holm | CC BY 3.0 |
-| 简谱 / MIDI 解析、窗口、合成 | 璇泽 | 见 LICENSE |
+| 简谱 / MIDI 解析、窗口、合成 | 璇泽科技 | 见 LICENSE |
 
 ---
 
@@ -285,5 +279,4 @@ Num8=C7  Num9=D7  Num/ =E7  Num* =F7  Num- =G7  Num+ =A7  Num. =B7
 - ❌ 任何有商业预期的使用
 
 完整条款见 [LICENSE](LICENSE)。
-
 
