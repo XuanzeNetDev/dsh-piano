@@ -1,8 +1,8 @@
-﻿{
+{
   "name": "dsh-piano-xz",
   "version": "2.1.0",
   "private": true,
-  "description": "璇泽 · DSH 电脑钢琴：标准 88 键钢琴，AI 用工具弹，网页右下角看得见也听得见",
+  "description": "璇泽科技 · DSH 电脑钢琴：标准 88 键钢琴，AI 用工具弹，网页右下角看得见也听得见",
   "type": "module",
   "main": "index.js",
   "exports": {
