@@ -89,6 +89,132 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /optimize
 ```
 
 ---
+## 多乐器（GM 128 音色）
+
+钢琴之外，可以换成任何 General MIDI 乐器 —— 小提琴、弦乐合奏、长笛、
+尼龙弦吉他、小号、打击乐……**128 个音色，程序号就是 GM 标准编号**。
+
+### 为什么 MIDI 天生支持多乐器
+
+MIDI 规范里有一条 `Program Change` 事件（状态字节 `0xC0`），
+一个字节就是音色号。同一份文件里，第 1 轨开头切成钢琴、第 2 轨切成弦乐，
+播放时两条轨各发各的声 —— 这不是插件额外做的功能，是 MIDI 1991 年就定下的机制。
+
+本插件把这个机制接了出来：`lib/midi.js` 解析 `0xC0`，
+事件里带上 `pg`（音色号）和 `ch`（通道），窗口收到就切。
+
+### 用起来是什么样
+
+```
+piano_instrument({ list: true })      # 列出 128 个音色
+piano_instrument({ program: 40 })     # 切到小提琴
+piano_instrument({ name: "弦乐" })     # 按名字模糊匹配
+```
+
+切完之后 `piano_play` / `piano_midi` 都用新音色。
+一个 MIDI 文件里本来就换了音色的，会**自动跟着换**，不需要手动干预。
+
+### 你选的乐器优先于 MIDI 文件
+
+几乎所有 MIDI 文件在开头都发 `Program Change → 0`（钢琴）。
+想在界面上选大提琴把这首钢琴曲拉一遍，不能被文件盖回去。
+
+**默认规则（不需要任何配置）：**
+
+| 你选的乐器 | 遇到文件里的 Program Change |
+|---|---|
+| 非钢琴（如 42 大提琴） | **忽略**，保持你选的 |
+| 钢琴（program 0） | 跟随文件（多轨换音色才有意义） |
+| 文件改成另一个非钢琴音色 | 照做（那是真实的换乐器，不是"切回钢琴"） |
+
+日志会写明判断过程：
+
+```
+EVPROG 忽略文件里的 pg=0，保持 10（用户选的）
+EVPROG -> 48 Strings（文件换乐器）
+```
+
+**想彻底锁死某个音色**（连文件里的换乐器都不理），用 `forceProgram`：
+
+```json
+{ "snapped": true, "program": 42, "bank": 0, "forceProgram": 42 }
+```
+
+启动日志会标 `[强制]`。注意它是**一次性的** —— 读完立刻从文件里删掉，
+否则以后你用 `piano_instrument` 切任何音色都会失效。
+
+### 循环长度校验
+
+SF2 的采样靠 loop 点循环播放来维持长音。但循环段太短会有可闻的嗡鸣
+（每秒重复几百次的固定频率，听起来像啸叫）。
+
+导出时加了硬门槛：**循环段短于 64 个采样点（约 1.5ms）就退化为不循环**，
+让包络自然衰减收尾。实测 128 个乐器里有 9 个（都在 Vibraphone）触发这条，
+退化之后听感正常。
+
+### 音源从哪来
+
+用 **FluidR3Mono_GM.sf3**（22 MB，MIT 许可，已入库）。
+它装着 128 个乐器的全部采样，但采样是 **Ogg Vorbis 压缩**的，
+没法直接实时播（每次播放都要现场解压，延迟会毁掉）。
+
+所以要**离线导一次**：
+
+```bash
+python tools/extract_gm.py
+```
+
+- 默认导出全部 128 个乐器，每个采样保留 4 秒，约 **2.5 GB**
+- 只想要常用的几个：`python tools/extract_gm.py --only 0,40,48`（约 65 MB）
+- 嫌大可以截短：`python tools/extract_gm.py --max-seconds 1.5`
+
+导出的 WAV 在 `assets/gm/out/`，**不进版本库**（`.gitignore` 排除），
+因为随时能从 sf3 重新生成。**导一次就够，之后不用再跑。**
+
+### 音域与力度
+
+GM 里一个乐器通常只有 10–164 个采样覆盖整个键盘，不像钢琴那样每键一个。
+中间的音靠**变调**补：`rate = 2^((目标音高 - 采样原始音高)/12)`。
+我们的插值用的是 8-tap Lanczos 带限重采样，不是线性插值，
+所以变调时不会出现"格子卡住"的混叠声。
+
+力度分层也是 GM 自带的：同一声部按 `velRange` 分成多层，
+轻弹和重弹用的是不同采样，不是简单调音量。
+
+### 变调基准：为什么不能信原始文件里的 root key
+
+SF2 里"这个采样录在哪个音高"有两个来源：
+
+| 位置 | 字段 | 说明 |
+|---|---|---|
+| `shdr` 采样头 | `originalPitch` | 采样自己写的 |
+| `igen` 乐器层 | `overridingRootKey`（op 58） | **显式覆盖，优先级更高** |
+
+**FluidR3Mono_GM.sf3 的 `shdr.originalPitch` 大面积是错的** —— 同一个乐器里
+所有采样都写同一个值（长笛全写 72、口琴全写 60），跟实际录制音高差 10~12 个半音。
+
+漏掉 `overridingRootKey` 的后果：
+
+```
+长笛采样实际录在 C#4(61)，shdr 却写 72
+弹 C4(60)：
+  错误：rate = 2^((60-72)/12) = 0.50   ← 降了一个八度，采样被拉长一倍
+  正确：rate = 2^((60-61)/12) = 0.944  ← 几乎原速
+```
+
+听感就是**"调不对 + 刺耳"**：音低了一个八度，而且降调把共振峰全推歪了。
+
+`tools/extract_gm.py` 现在按规范优先取 `overridingRootKey`，
+索引里同时留了 `rawOriginalPitch` 便于排查。
+
+### 循环
+
+弦乐、风琴、合成铺底这些是**持续音**，采样只有 1–3 秒，
+靠 sf2 自带的 loop 点循环播放，拉多长都不断。
+钢琴、打击乐这类衰减音不循环，播完就结束。
+
+---
+
 ## 三个"标准"
 
 ### 1. 键盘是标准钢琴
@@ -231,6 +357,63 @@ python tools/extract-sf2.py
 
 ---
 
+## 界面
+
+标题栏右上角三个东西：
+
+```
+[● 钢琴]  [▼ 10 · Music Box]  [MIDI]
+   ↑              ↑              ↑
+  开关窗口      选乐器        导入 .mid 播放
+```
+
+### 乐器选择器
+
+点开是一个可搜索的列表：
+
+- **搜索**：打 `violin`、`弦乐`、或直接打编号 `48`
+- **滚到哪记到哪**：下次打开停在同一位置（存 `localStorage`）
+- **分类吸顶**：滚动时分类名固定在顶部
+- **快捷键**：`Ctrl + ↑` / `Ctrl + ↓` 切上一个/下一个乐器
+
+快捷键在聊天输入框里不生效（那儿的 `Ctrl+↑↓` 有别的用途），
+点一下页面其他地方就能用。
+
+### 导入 MIDI
+
+点「MIDI」选一个 `.mid` 文件，会：
+
+1. 上传给宿主解析
+2. **自动把钢琴窗口拉起来**（如果没开）
+3. 从第一个音开始就用**你当前选的乐器**
+
+工具栏不会因为导入而抖动 —— 按钮宽度固定，结果只在失败时通过悬停提示显示。
+
+## 导出
+
+把当前队列里的曲子渲染成 WAV。**没有按钮，在对话里说一句就行**：
+
+```
+piano_export()                          → 时间戳命名
+piano_export({ file: "我的曲子.wav" })   → 指定文件名
+```
+
+**离线渲染**，不走扬声器：
+
+| | 实时播放 | 离线渲染 |
+|---|---|---|
+| 一首 4 分钟的歌 | 等 4 分钟 | **约 1 秒**（几百倍速） |
+| 系统卡顿影响 | 会掉帧 | 不影响 |
+| 结果确定性 | 每次略有不同 | **完全可复现** |
+
+音色、包络、循环用的都是演奏时同一套代码（`MixVoice` 实时和离线共用），
+所以导出的声音和你听到的一模一样。
+
+输出在插件目录的 `record/` 下，默认 44100Hz 单声道 16bit。
+
+要 MP3 的话把扩展名写成 `.mp3` 之后用 ffmpeg 转 —— 内置不直接生成 MP3
+（别人的机器不一定装了 ffmpeg，写死路径会让插件在他们那儿失败）。
+
 ## 工具（Host 侧）
 
 | 工具 | 作用 |
@@ -241,6 +424,7 @@ python tools/extract-sf2.py
 | `piano_piece` | 内置曲目（小星星、欢乐颂、致爱丽丝、卡农…） |
 | `piano_stop` | 立刻静音 |
 | `piano_status` | 队列状态、下一个音、键盘范围 |
+| `piano_instrument` | 切换 GM 乐器（128 音色），可列出清单 |
 
 HTTP 前缀：`/api/dsh-piano-xz`
 
@@ -250,26 +434,35 @@ HTTP 前缀：`/api/dsh-piano-xz`
 
 ```
 dsh-piano/
-├── index.js              Host 侧：6 个工具 + HTTP 路由（985 行）
-├── client.js             浏览器侧：88 键渲染 + Web Audio（1676 行）
-├── cordis.patch.yml      插件挂载点
+├── index.js               Host 侧：8 个工具 + HTTP 路由（1637 行）
+├── client.js              浏览器侧：88 键渲染 + 乐器选择器（2110 行）
+├── cordis.patch.yml       插件挂载点
 ├── package.json
 ├── icon.svg
+├── install.ps1            Windows 一键安装
 ├── lib/
-│   ├── notation.js       简谱解析（379 行）
-│   ├── midi.js           MIDI 解析 + tempo map（329 行）
-│   ├── engine.js         事件队列 / 调度（180 行）
-│   ├── notes.js          音名 ↔ MIDI（199 行）
-│   └── score.js          谱面读写（131 行）
+│   ├── notation.js        简谱解析（379 行）
+│   ├── midi.js            MIDI 解析 + Program Change（360 行）
+│   ├── engine.js          事件队列 / 调度 / 导出快照（249 行）
+│   ├── notes.js           音名 ↔ MIDI（199 行）
+│   └── score.js           谱面读写（131 行）
 ├── tools/
-│   ├── PianoWindow.cs    独立窗口 WinForms（1701 行）
-│   ├── PianoAudio.cs     waveOut 实时合成（574 行）
-│   └── extract-sf2.py    SoundFont → 88 个 wav
+│   ├── PianoWindow.cs     独立窗口 WinForms（2157 行）
+│   ├── PianoAudio.cs      waveOut 混音 + 离线渲染（869 行）
+│   ├── GmEngine.cs        GM 多乐器引擎（375 行）
+│   ├── sf2_parse.py       SF2/SF3 完整解析（352 行）
+│   ├── extract_gm.py      GM 音源 → WAV 导出（301 行）
+│   ├── verify_gm.mjs      128 音色覆盖检查（144 行）
+│   ├── extract-sf2.py     Yamaha SoundFont → 88 个 wav（150 行）
+│   └── PianoWindow.exe    预编译好的播放器
 ├── assets/
-│   ├── piano/            Salamander mp3（网页试听用）
-│   └── yup/wav/          Yamaha 88 键采样（EXE 发声用）
-├── scores/               示例乐谱与 MIDI
-├── locale/               zh / en
+│   ├── piano/             Salamander mp3（网页试听用）
+│   ├── yup/wav/           Yamaha 88 键采样（钢琴，EXE 发声用）
+│   └── gm/
+│       ├── FluidR3Mono_GM.sf3   GM 128 音色音源（22 MB，已入库）
+│       └── out/                 导出的采样（gitignore，本地生成）
+├── scores/                示例乐谱与 MIDI
+├── locale/                zh / en
 └── LICENSE
 ```
 
@@ -296,6 +489,16 @@ Num8=C7  Num9=D7  Num/ =E7  Num* =F7  Num- =G7  Num+ =A7  Num. =B7
 ---
 
 ## 致谢与音源许可
+
+**音源**
+
+| 音源 | 用途 | 许可 |
+|---|---|---|
+| Yamaha Upright（每键 88 采样） | 钢琴 | 见原作者声明 |
+| **FluidR3Mono_GM.sf3** | **GM 128 音色** | **MIT** |
+| Salamander Grand Piano V3 | 网页端钢琴兜底 | CC BY 3.0 |
+
+
 
 | 资源 | 作者 / 来源 | 许可 |
 |---|---|---|

@@ -1,4 +1,4 @@
-﻿# DSH 钢琴 —— Windows 一键安装
+# DSH 钢琴 —— Windows 一键安装
 # 用法：右键 PowerShell 运行，或在仓库根目录执行 .\install.ps1
 
 $ErrorActionPreference = "Stop"
@@ -50,7 +50,23 @@ if ($n -ge 88) {
     Write-Host "    需要下载 Yamaha Upright.sf2 后运行：python tools\extract-sf2.py"
 }
 
-# 4) 检查 EXE
+# 4) 检查 GM 音源（多乐器用）
+$gmSf = Join-Path $here "assets\gm\FluidR3Mono_GM.sf3"
+$gmOut = Join-Path $here "assets\gm\out\index.json"
+if (Test-Path $gmOut) {
+    $gmN = (Get-ChildItem (Join-Path $here "assets\gm\out") -Directory -Filter "p*" -ErrorAction SilentlyContinue).Count
+    Write-Host "  多乐器：已导出 $gmN 个乐器 ✓" -ForegroundColor Green
+} elseif (Test-Path $gmSf) {
+    Write-Host "  多乐器：音源在，但还没导出采样" -ForegroundColor Yellow
+    Write-Host "    想用钢琴以外的乐器（小提琴/弦乐/长笛…），跑一次：" -ForegroundColor Yellow
+    Write-Host "      python tools\extract_gm.py" -ForegroundColor Yellow
+    Write-Host "    （全部 128 个约 3-5 分钟、840 MB；只导常用的：--only 0,40,48）" -ForegroundColor Yellow
+    Write-Host "    不导出也不影响钢琴。" -ForegroundColor Gray
+} else {
+    Write-Host "  多乐器：没找到 assets\gm\FluidR3Mono_GM.sf3（只影响钢琴以外的音色）" -ForegroundColor Gray
+}
+
+# 5) 检查 EXE
 $exe = Join-Path $here "tools\PianoWindow.exe"
 if (Test-Path $exe) {
     Write-Host "  播放器：tools\PianoWindow.exe ✓" -ForegroundColor Green
@@ -62,9 +78,10 @@ if (Test-Path $exe) {
         exit 1
     }
     Push-Location (Join-Path $here "tools")
+    # GmEngine.cs 必须一起编译：PianoWindow.cs 里引用了 GmEngine
     & $csc /nologo /target:winexe /optimize+ /out:PianoWindow.exe `
         /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll `
-        PianoWindow.cs PianoAudio.cs
+        PianoWindow.cs PianoAudio.cs GmEngine.cs
     Pop-Location
     if (Test-Path $exe) { Write-Host "    编译完成 ✓" -ForegroundColor Green }
     else { Write-Host "    编译失败" -ForegroundColor Red; exit 1 }

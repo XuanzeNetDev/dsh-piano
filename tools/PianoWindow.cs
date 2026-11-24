@@ -251,6 +251,18 @@ namespace DshPiano
         public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOSIZE = 0x0001;
         public const uint SWP_FRAMECHANGED = 0x0020;
+        /// <summary>
+        /// 阻止系统发送 WM_WINDOWPOSCHANGING。
+        ///
+        /// 这条是"窗口能不能跑到屏幕外"的关键：
+        /// SetWindowPos 默认会发 WM_WINDOWPOSCHANGING，WinForms 收到后
+        /// 按 WM_GETMINMAXINFO 的约束把窗口夹回可见区域 ——
+        /// 于是我们设的 y=-70 被系统改回 y=40（= 工作区顶）。
+        ///
+        /// 加上这个标志，消息不发，位置就是我们要的那个。
+        /// 参考：https://stackoverflow.com/questions/6645085
+        /// </summary>
+        public const uint SWP_NOSENDCHANGING = 0x0400;
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
         [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
@@ -325,7 +337,16 @@ namespace DshPiano
 
         long skewMs;
         long seq;
-        bool primed;
+        bool primed = false;
+        int presetTick = 0;             // /preset 轮询计数（每 10 次查一次）
+        internal static int forceProgram = -1;   // >= 0 时锁死音色，忽略 MIDI 自带的 Program Change
+        /// <summary>--snap 参数值。null = 没传，读 settings.json。</summary>
+        internal static bool? SnapArg;
+        /// <summary>
+        /// 启动时从 settings.json 恢复的乐器号。
+        /// >= 0 表示"还没被宿主 /preset 确认过"；宿主一表态就置 -1。
+        /// </summary>
+        internal static int pendingRestoreProgram = -1;
         long playFromMs, playToMs;      // 顶栏进度用
         string lastFile = "";           // 上一首的文件名（用于判断换曲）
         long lastSeq = 0;
@@ -463,7 +484,8 @@ namespace DshPiano
             // 15ms 的播放泵：Poll 只入队，真正发声由它按 t 到点触发。
             // 之前直接在 Poll 里播，第一轮把几百条事件一口气全播了 —— 就是"一瞬间播完"。
             // 恢复上次的吸附状态
-            snapped = LoadSnapSetting();
+            snapped = SnapArg.HasValue ? SnapArg.Value : LoadSnapSetting();
+            Audio.Log("SNAP " + (snapped ? "on" : "off") + " (默认吸附)");
             if (snapped)
             {
                 ApplyDragLock(true);
@@ -503,47 +525,6 @@ namespace DshPiano
                     }
                     Audio.Log("POLL since=" + seq + " evs=" + evs.Count + " primed=" + primed);
 
-                    lock (gate)
-                    {
-                        if (!primed)
-                        {
-                            // 第一次轮询要照常处理。
-                            // 早先这里是"只对齐序号、不播、直接 return"，但宿主的 /events
-                            // 每次请求都会把游标推到最新 seq —— 这么一 return，整批事件就被
-                            // 消耗掉了，之后再也取不到，表现就是"完全没声音"。
-                            // 已经过期的音会被下面的 endLocal > cur 自然滤掉，不用担心炸响。
-                            seq = 0;
-                            primed = true;
-                        }
-                        foreach (var raw in evs)
-                        {
-                            var e = raw as Dictionary<string, object>;
-                            if (e == null) continue;
-                            long i = Convert.ToInt64(e["i"], CultureInfo.InvariantCulture);
-                            if (i > seq) seq = i;
-                            long d = Convert.ToInt64(e["d"], CultureInfo.InvariantCulture);
-                            int m = Convert.ToInt32(e["m"], CultureInfo.InvariantCulture);
-                            long cur = localNow + skewMs;
-                            // 结束时刻必须用事件自己的开始时刻 t 来算。
-                            // 原来写成 hostNow + d（服务器当前时间 + 时长），整首曲子是提前排好的，
-                            // t 都在未来，算出来的"结束"比现在还早，于是绝大多数音被当成过期丢掉。
-                            long t0 = e.ContainsKey("t") ? Convert.ToInt64(e["t"], CultureInfo.InvariantCulture) : cur;
-                            long endLocal = t0 + d;
-                            // 只播"现在还没开始"或"刚刚开始"的音。
-                            // 宿主首次会吐上万条历史事件（t 全在过去），
-                            // 不过滤就等于把整首曲子几秒内播完 —— 听感是"快进"。
-                            // 200ms 的容差足够吸收轮询抖动，又不会把真正该响的音丢掉。
-                            if (t0 < cur - 200) continue;
-                            if (endLocal > cur)
-                            {
-                                double v = 0.8;
-                                if (e.ContainsKey("v")) v = Convert.ToDouble(e["v"], CultureInfo.InvariantCulture);
-                                // 宿主新版会带 h（左右手）；旧版没有就按音高兜底：
-                                // 低于 C4 视为左手，否则右手。
-                                int hand = e.ContainsKey("h") ? Convert.ToInt32(e["h"]) : (m < 60 ? 1 : 0);
-                                pending.Add(new Pending { T = t0, Midi = m, Vel = v, Dur = d, Hand = hand });
-                            }
-                        }
                         if (root.ContainsKey("label") && root["label"] is string) nowPlaying = (string)root["label"];
                         // 曲子的调号 / 拍号 / 速度
                         if (root.ContainsKey("score") && root["score"] is Dictionary<string, object>)
@@ -574,33 +555,256 @@ namespace DshPiano
                                 if (num > 0 && den > 0) scoreTime = num + "/" + den;
                             }
                             if (sc.ContainsKey("bpm")) scoreBpm = Convert.ToInt32(sc["bpm"]);
-                            // 换曲子（或同一首重弹）就清空旧队列。
-                            // 不清的话，几次弹奏会叠在一起，音全挤在同一时间段响 —— 听感是"非常快"。
+                            // ── 每次新谱都清空旧队列 ──
+                            //
+                            // 原来只有在"文件名变了"的时候才清。简谱根本没有 file 字段
+                            // （fileTag 恒为空字符串），于是：
+                            //   第一次弹  → lastFile 从 "" 变成 ""，没变化，不清
+                            //   再弹同一首 → 还是 ""，不清
+                            // 旧队列里几百个未来音原封不动留着，和新排的叠在一起，
+                            // 听感就是"点了马上响一半、过一会儿又响一遍"，或者"特别快"。
+                            //
+                            // 现在的判据是**序号前进了**：宿主每次 schedule 都会把 seq 推上去，
+                            // seq 变了就说明"这是新的一批音"，无条件清空。
+                            // 同一个 seq 只处理一次（下面的 seq 游标保证），不会反复清。
                             string fileTag = sc.ContainsKey("file") ? Convert.ToString(sc["file"]) : "";
                             long seqTag = snapshotSeq;
-                            if (fileTag != lastFile || (seqTag != lastSeq && fileTag.Length > 0 && pending.Count == 0))
+                            bool isNewBatch = seqTag != lastSeq && evs.Count > 0;
+                            if (isNewBatch)
                             {
-                                if (fileTag != lastFile)
-                                {
-                                    pending.Clear();
-                                    lock (gate) lit.Clear();
-                                    Audio.AllOff();
-                                    paused = false; pauseOffset = 0; pausedAt = 0;
-                                    playFromMs = 0; playToMs = 0;
-                                    Audio.Log("NEWPIECE " + fileTag);
-                                }
+                                int dropped = pending.Count;
+                                pending.Clear();
+                                lock (gate) lit.Clear();
+                                Audio.AllOff();
+                                paused = false; pauseOffset = 0; pausedAt = 0;
+                                playFromMs = 0; playToMs = 0;
+                                Audio.Log((fileTag.Length > 0 ? "NEWPIECE " + fileTag : "NEWSCORE 谱文本")
+                                          + (dropped > 0 ? " 清掉旧队列 " + dropped + " 条" : ""));
                                 lastFile = fileTag;
                             }
                             lastSeq = seqTag;
                         }
-                        if (pending.Count > 0)
+                        // pending / playFromMs / playToMs 由 Pump() 那一侧并发读写，
+                        // 这一段必须在 gate 里。
+                        lock (gate)
                         {
-                            playToMs = pending[0].T;
-                            foreach (var pn in pending) if (pn.T > playToMs) playToMs = pn.T;
-                            if (playFromMs == 0) playFromMs = pending[0].T;
+                            if (pending.Count > 0)
+                            {
+                                playToMs = pending[0].T;
+                                foreach (var pn in pending) if (pn.T > playToMs) playToMs = pn.T;
+                                if (playFromMs == 0) playFromMs = pending[0].T;
+                            }
+                            primed = true;
                         }
-                        primed = true;
+
+
+                    // ── 离线渲染任务 ──
+                    // 宿主把待渲染的时间轴放在 /render/pending，这里取回来渲染成 WAV。
+                    // 每 10 次轮询查一次（约 1 秒）。
+                    if (presetTick % 10 == 3)
+                    {
+                        try
+                        {
+                            var rjson = Fetch(api + "/render/pending");
+                            if (!string.IsNullOrEmpty(rjson) && rjson.IndexOf("\"id\"") >= 0)
+                            {
+                                var rser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                                var rroot = rser.Deserialize<Dictionary<string, object>>(rjson);
+                                if (rroot != null && rroot.ContainsKey("id"))
+                                {
+                                    string rid = Convert.ToString(rroot["id"]);
+                                    string outPath = rroot.ContainsKey("out")
+                                        ? Convert.ToString(rroot["out"]) : "";
+                                    var tl = rroot.ContainsKey("timeline")
+                                        ? rroot["timeline"] as System.Collections.IList : null;
+                                    if (tl != null && tl.Count > 0 && outPath.Length > 0)
+                                    {
+                                        Audio.Log("RENDER start id=" + rid + " notes=" + tl.Count);
+                                        double sec = 0;
+                                        try { sec = Audio.RenderToWav(outPath, tl); }
+                                        catch (Exception rex)
+                                        {
+                                            Audio.Log("RENDER fail " + rex.GetType().Name + ": " + rex.Message);
+                                        }
+                                        // 回报结果，宿主据此把任务标成完成
+                                        var ser3 = new JavaScriptSerializer();
+                                        string j = "{\"id\":" + ser3.Serialize(rid)
+                                                 + ",\"ok\":" + (sec > 0 ? "true" : "false")
+                                                 + ",\"seconds\":" + sec.ToString("0.00",
+                                                     CultureInfo.InvariantCulture) + "}";
+                                        try
+                                        {
+                                            var req = (System.Net.HttpWebRequest)WebRequest.Create(api + "/render/done");
+                                            req.Method = "POST";
+                                            req.ContentType = "application/json";
+                                            req.Timeout = 15000;
+                                            req.ReadWriteTimeout = 15000;
+                                            // 关键：Windows 的 HttpWebRequest 默认会先发
+                                            // "Expect: 100-continue" 探路，本地小服务不一定应答，
+                                            // 于是 GetRequestStream() 卡住直到超时 ——
+                                            // 表现出来就是"渲染成功但回调永远到不了"。
+                                            req.ServicePoint.Expect100Continue = false;
+                                                                var bb = System.Text.Encoding.UTF8.GetBytes(j);
+                                            req.ContentLength = bb.Length;
+                                            using (var st = req.GetRequestStream()) st.Write(bb, 0, bb.Length);
+                                            using (var rr = req.GetResponse())
+                                            {
+                                                Audio.Log("RENDER callback ok " + j);
+                                            }
+                                        }
+                                        catch (Exception cex)
+                                        {
+                                            // 不要静默吞 —— 之前就是这里吞了，
+                                            // 渲染明明成功、前端却等 60 秒超时。
+                                            Audio.Log("RENDER callback FAIL " + cex.GetType().Name + ": " + cex.Message
+                                                      + "  payload=" + j);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
                     }
+
+                    // ── 乐器切换 ──
+                    // 宿主那边 /preset 存着当前乐器，这里定期问一下。
+                    // 每 10 次轮询查一次（约 1 秒），不占带宽也不影响时序。
+                    if (++presetTick % 10 == 0)
+                    {
+                        try
+                        {
+                            var pjson = Fetch(api + "/preset");
+                            if (!string.IsNullOrEmpty(pjson))
+                            {
+                                var ser2 = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                                var pr = ser2.Deserialize<Dictionary<string, object>>(pjson);
+                                if (pr != null && pr.ContainsKey("program"))
+                                {
+                                    int wantProg = Convert.ToInt32(pr["program"], CultureInfo.InvariantCulture);
+                                    int wantBank = pr.ContainsKey("bank")
+                                        ? Convert.ToInt32(pr["bank"], CultureInfo.InvariantCulture) : 0;
+                                    if (forceProgram < 0
+                                        && (wantProg != GmEngine.CurrentProgram || wantBank != GmEngine.CurrentBank))
+                                    {
+                                        if (GmEngine.SetProgram(wantBank, wantProg))
+                                        {
+                                            Audio.Log("PRESET -> " + wantProg + " "
+                                                      + (GmEngine.Current != null ? GmEngine.Current.Name : "?")
+                                                      + (PianoForm.pendingRestoreProgram >= 0
+                                                         ? "（覆盖启动时的 " + PianoForm.pendingRestoreProgram + "，以宿主为准）" : ""));
+                                            PianoForm.pendingRestoreProgram = -1;
+                                            SaveStateSetting();
+                                        }
+                                        else
+                                            Audio.Log("PRESET miss " + wantBank + "/" + wantProg
+                                                      + "（这个乐器没导出）");
+                                    }
+                                    else if (PianoForm.pendingRestoreProgram >= 0)
+                                    {
+                                        // 宿主和当前一致（或已经对齐），启动恢复完成
+                                        PianoForm.pendingRestoreProgram = -1;
+                                    }
+                                }
+                            }
+                        }
+                        catch { /* 宿主暂时不可达，下次再试 */ }
+                    }
+
+                    lock (gate)
+                    {
+                        if (!primed)
+                        {
+                            // 第一次轮询要照常处理。
+                            // 早先这里是"只对齐序号、不播、直接 return"，但宿主的 /events
+                            // 每次请求都会把游标推到最新 seq —— 这么一 return，整批事件就被
+                            // 消耗掉了，之后再也取不到，表现就是"完全没声音"。
+                            // 已经过期的音会被下面的 endLocal > cur 自然滤掉，不用担心炸响。
+                            seq = 0;
+                            primed = true;
+                        }
+                        foreach (var raw in evs)
+                        {
+                            var e = raw as Dictionary<string, object>;
+                            if (e == null) continue;
+                            long i = Convert.ToInt64(e["i"], CultureInfo.InvariantCulture);
+                            if (i > seq) seq = i;
+                            long d = Convert.ToInt64(e["d"], CultureInfo.InvariantCulture);
+                            int m = Convert.ToInt32(e["m"], CultureInfo.InvariantCulture);
+
+                            // ── 音色切换 ──
+                            // 事件里带 pg 就说明这个音该用某个 GM 音色。
+                            // 通道 9 是鼓组（0 起的 9 = 第 10 通道），它的 program 无意义，
+                            // 音高直接映射到鼓件，所以跳过程序号切换。
+                            if (GmEngine.Ready && e.ContainsKey("pg"))
+                            {
+                                int pg = Convert.ToInt32(e["pg"], CultureInfo.InvariantCulture);
+                                int ch = e.ContainsKey("ch") ? Convert.ToInt32(e["ch"], CultureInfo.InvariantCulture) : 0;
+                                if (forceProgram >= 0)
+                                {
+                                    // 强制模式：MIDI 里的 Program Change 一律不理
+                                }
+                                else if (ch != 9 && pg != GmEngine.CurrentProgram)
+                                {
+                                    // ── 规则：用户在界面上选的乐器优先于 MIDI 文件 ──
+                                    //
+                                    // MIDI 文件开头几乎都发 Program Change → 0（钢琴）。
+                                    // 如果照单全收，你想用大提琴拉一首钢琴曲就永远做不到：
+                                    // 文件说"这是钢琴"，于是第一个音先响一声钢琴，
+                                    // 0.1 秒后 /preset 轮询又把音色拉回大提琴 ——
+                                    // 听感是"先来一声钢琴再变"。
+                                    //
+                                    // 现在改成：
+                                    //   · 用户选的是非钢琴（program != 0）→ 忽略文件里的 pg
+                                    //   · 用户选的就是钢琴（program == 0）→ 跟随文件（多轨换音色才有意义）
+                                    //
+                                    // 想强行覆盖成某个乐器，用 settings.json 的 forceProgram。
+                                    if (GmEngine.CurrentProgram == 0)
+                                    {
+                                        if (GmEngine.SetProgram(pg))
+                                        {
+                                            Audio.Log("EVPROG -> " + pg + " " + GmEngine.Current.Name + "（用户选的钢琴，跟随文件）");
+                                            SaveStateSetting();
+                                        }
+                                    }
+                                    else if (pg != 0)
+                                    {
+                                        // 文件里有真实的换乐器（不是"切回钢琴"），照做
+                                        if (GmEngine.SetProgram(pg))
+                                        {
+                                            Audio.Log("EVPROG -> " + pg + " " + GmEngine.Current.Name + "（文件换乐器）");
+                                            SaveStateSetting();
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Audio.Log("EVPROG 忽略文件里的 pg=0，保持 " + GmEngine.CurrentProgram
+                                                  + "（用户选的）");
+                                    }
+                                }
+                            }
+                            long cur = localNow + skewMs;
+                            // 结束时刻必须用事件自己的开始时刻 t 来算。
+                            // 原来写成 hostNow + d（服务器当前时间 + 时长），整首曲子是提前排好的，
+                            // t 都在未来，算出来的"结束"比现在还早，于是绝大多数音被当成过期丢掉。
+                            long t0 = e.ContainsKey("t") ? Convert.ToInt64(e["t"], CultureInfo.InvariantCulture) : cur;
+                            long endLocal = t0 + d;
+                            // 只播"现在还没开始"或"刚刚开始"的音。
+                            // 宿主首次会吐上万条历史事件（t 全在过去），
+                            // 不过滤就等于把整首曲子几秒内播完 —— 听感是"快进"。
+                            // 200ms 的容差足够吸收轮询抖动，又不会把真正该响的音丢掉。
+                            if (t0 < cur - 200) continue;
+                            if (endLocal > cur)
+                            {
+                                double v = 0.8;
+                                if (e.ContainsKey("v")) v = Convert.ToDouble(e["v"], CultureInfo.InvariantCulture);
+                                // 宿主新版会带 h（左右手）；旧版没有就按音高兜底：
+                                // 低于 C4 视为左手，否则右手。
+                                int hand = e.ContainsKey("h") ? Convert.ToInt32(e["h"]) : (m < 60 ? 1 : 0);
+                                pending.Add(new Pending { T = t0, Midi = m, Vel = v, Dur = d, Hand = hand });
+                            }
+                        }
+                    }   // lock (gate)
+                    // 只重画一次，别在锁里碰 UI
                     BeginInvoke(new Action(Invalidate));
                 }
                 catch (Exception ex) { Audio.Log("POLLERR " + ex.GetType().Name + ": " + ex.Message); }
@@ -651,7 +855,7 @@ namespace DshPiano
                             int midi = KeyMap.BaseMidi + semi + kbdOctave * 12;
                             if (midi >= 21 && midi <= 108)
                             {
-                                Audio.Play(midi, 0.72);
+                                PlayNote(midi, 0.72, 400);
                                 long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + skewMs - pauseOffset;
                                 lock (gate)
                                     lit[midi] = new Lit { Until = now + 380, Hand = semi < 12 ? 1 : 0 };
@@ -737,6 +941,73 @@ namespace DshPiano
             Audio.Log("LOCHHOOK " + (locHook != IntPtr.Zero ? "已装" : "失败"));
         }
 
+        /// <summary>上一帧是贴在 DSH 上方（true）还是下方（false）。</summary>
+        bool lastAbove = true;
+        int lastAboveY = int.MinValue;   // 上一次贴上方时的 y（避免重复打日志）
+
+        /// <summary>
+        /// 决定钢琴该放在 DSH 上方还是下方。
+        ///
+        /// 规则：
+        ///   1) DSH 上方（屏幕顶到 DSH 顶）放得下 → 贴上方
+        ///   2) 放不下，下方（DSH 底到屏幕底）放得下 → 贴下方
+        ///   3) 都放不下 → 贴上方，但纵向夹在屏幕内（宁可压一点，也不跑到屏幕外）
+        ///
+        /// 为什么要有 2)：屏幕只有 1067 高、DSH 又常被拖到顶上时，
+        /// hostY - Height 会变成负数 —— 钢琴一半在屏幕外，看起来就是
+        /// "跟 DSH 覆盖在一块儿"。之前没有这条回退。
+        /// </summary>
+        int ChooseTop(int hostX, int hostY, int hostW)
+        {
+            var wa = Screen.FromHandle(hostHwnd != IntPtr.Zero ? hostHwnd : Handle).WorkingArea;
+            int above = hostY - Height;
+            if (above >= wa.Top)
+            {
+                allowOffscreen = false;   // 正常情况，不需要放行负坐标
+                if (!lastAbove) Audio.Log("PLACE above y=" + above);
+                lastAbove = true;
+                return above;
+            }
+
+            int hostH = Math.Max(1, lastHostH);
+            int below = hostY + hostH;
+            if (below + Height <= wa.Bottom)
+            {
+                if (lastAbove) Audio.Log("PLACE below y=" + below + " (上方只剩 " + (hostY - wa.Top) + "px，放不下 " + Height + "px)");
+                lastAbove = false;
+                return below;
+            }
+
+            // ── 上方空间不足：允许钢琴超出屏幕顶 ──
+            //
+            // 关键决定：**不动 DSH**。
+            // DSH 是主应用，用户摆在哪就是哪；钢琴是附属窗口，
+            // 它该"穿出屏幕"而不是把主应用挤走。
+            //
+            // 所以这里直接返回 above（可能 < wa.Top，即负坐标），
+            // 让窗口顶到屏幕外一部分 —— Windows 允许窗口有负坐标，
+            // 露出来的部分照常显示、照常响应。
+            //
+            // 之前写成"把 DSH 往下推"，那是把从属关系搞反了：
+            // 用户拖一下 DSH 结果整个界面跟着跳，非常突兀。
+            if (above < wa.Top)
+            {
+                // 上方不够，允许穿出屏幕顶。这个标志让 WndProc 放行负坐标。
+                allowOffscreen = true;
+                // 只在"从下方切回上方"时打一行，别每帧刷屏
+                if (!lastAbove)
+                    Audio.Log("PLACE above-outside y=" + above + " (超出工作区顶 " + (wa.Top - above) + "px)");
+            }
+            else
+            {
+                allowOffscreen = false;
+            }
+            lastAbove = true;
+            lastAboveY = above;
+            return above;
+        }
+
+
         /// <summary>把钢琴贴到 DSH 正上方（不重绘）。</summary>
         void SnapToHost()
         {
@@ -761,6 +1032,7 @@ namespace DshPiano
                     cr.L = o2.X; cr.T = o2.Y; cr.R = o2.X + dw0; cr.B = o2.Y + dh0;
                 }
                 int hostW = cr.R - cr.L;
+                int hostH = cr.B - cr.T;
                 if (hostW <= 0) return;
                 int hostX = cr.L, hostY = cr.T;
 
@@ -771,11 +1043,14 @@ namespace DshPiano
                 if (lastHostX == int.MinValue)
                 {
                     // 第一次：绝对对齐一次，作为基准
-                    lastHostX = hostX; lastHostY = hostY; lastHostW = hostW;
-                    int t0 = hostY - Height;
-                    Native.SetWindowPos(Handle, IntPtr.Zero, hostX, t0, hostW, Height,
-                        Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+                    lastHostX = hostX; lastHostY = hostY; lastHostW = hostW; lastHostH = hostH;
+                    int t0 = ChooseTop(hostX, hostY, hostW);
+                    Native.SetWindowPos(Handle, snapped ? Native.HWND_TOPMOST : IntPtr.Zero,
+                        hostX, t0, hostW, Height,
+                        Native.SWP_NOACTIVATE | Native.SWP_NOSENDCHANGING
+                        | (snapped ? 0u : Native.SWP_NOZORDER));
                     setLeft = hostX; setTop = t0; setW = hostW;
+                    lastAbove = t0 < hostY;
                     return;
                 }
 
@@ -789,19 +1064,22 @@ namespace DshPiano
 
                 if (dx == 0 && dy == 0 && !bigW) return;   // 什么都没变，一帧都不动
 
-                lastHostX = hostX; lastHostY = hostY;
+                lastHostX = hostX; lastHostY = hostY; lastHostH = hostH;
                 if (bigW) lastHostW = hostW;
 
                 int newLeft = setLeft + dx;
-                int newTop = setTop + dy;
                 int newW = bigW ? hostW : setW;
+                // 纵向不用 setTop+dy：一旦从"贴上方"掉到"贴下方"（DSH 被拖上去、
+                // 或任务栏/屏幕边缘不够），加个 dy 会算到屏幕外面去。
+                // 每次按当前几何重新判断，成本可以忽略。
+                int newTop = ChooseTop(newLeft, hostY, newW);
 
                 setLeft = newLeft; setTop = newTop; setW = newW;
                 // 吸附时用 HWND_TOPMOST 并重申：光有 WS_EX_TOPMOST 位不够，
                 // 同层内还有顺序，DSH 最大化/切前台都可能把钢琴压到后面。
                 Native.SetWindowPos(Handle, snapped ? Native.HWND_TOPMOST : IntPtr.Zero,
                     newLeft, newTop, newW, Height,
-                    Native.SWP_NOACTIVATE);
+                    Native.SWP_NOACTIVATE | Native.SWP_NOSENDCHANGING);
             }
             finally { snapping = false; }
         }
@@ -860,7 +1138,7 @@ namespace DshPiano
                     int playMidi = pn.Midi + transpose;
                     if (playMidi < 21) playMidi = 21;
                     if (playMidi > 108) playMidi = 108;
-                    Audio.Play(playMidi, pn.Vel);
+                    PlayNote(playMidi, pn.Vel, (int)Math.Max(50, pn.Dur));
                     lit[pn.Midi] = new Lit { Until = now + Math.Max(160, Math.Min(900, pn.Dur)), Hand = pn.Hand };
                     pending.RemoveAt(i);
                     i--;
@@ -888,6 +1166,28 @@ namespace DshPiano
                 wc.Headers["User-Agent"] = ClientUa;
                 return wc.DownloadString(url);
             }
+        }
+
+        /// <summary>
+        /// 发一个音。有 GM 乐器库就走 GM（选采样 + 变调），否则回退钢琴引擎。
+        /// 三个播放点（时间轴 / 鼠标 / 键盘）都走这里，避免各写一份判断。
+        /// </summary>
+        static void PlayNote(int midi, double vel, int holdMs)
+        {
+            // program 0 是钢琴，**故意**不走 GM。
+            //
+            // 原因：钢琴用的是 Yamaha Upright 88 键每键独立采样（rate 恒为 1.0，
+            // 零变调、零混叠），这套音色是逐键挑、逐键调出来的。
+            // GM 音源里的 "Grand Piano" 只有 164 个采样覆盖 88 键，中间的音
+            // 必须靠变调补，音质和原来的钢琴不是一个档次。
+            //
+            // 所以钢琴这条路保持原样：program 0 → Audio.Play（老引擎）；
+            // 其他 127 个音色 → GmEngine.Play（选采样 + 变调 + 包络）。
+            if (GmEngine.Ready && GmEngine.CurrentProgram != 0)
+            {
+                if (GmEngine.Play(midi, vel, holdMs)) return;
+            }
+            Audio.Play(midi, vel);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -1240,7 +1540,7 @@ namespace DshPiano
             // 只在这里发声，不要再 PostNote 给宿主 ——
             // 两边各播一遍，起点差几十毫秒，叠起来就是"音不准""发怪"。
             // 窗口自身已经会点亮键，宿主的灯不要也无所谓。
-            Audio.Play(midi, 0.82);
+            PlayNote(midi, 0.82, 400);
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + skewMs - pauseOffset;
             lock (gate) lit[midi] = new Lit { Until = now + 620, Hand = midi < 60 ? 1 : 0 };
             if (repaint) Invalidate();
@@ -1283,7 +1583,7 @@ namespace DshPiano
         // SetWindowPos 设 -952，DPI 换算后 Left 读回来是 -953，
         // 拿实际值比较就永远判定"有差异"，于是每帧都移 → 位置来回变、画面闪。
         int setLeft = int.MinValue, setTop = int.MinValue, setW;
-        int lastHostX = int.MinValue, lastHostY = int.MinValue, lastHostW;
+        int lastHostX = int.MinValue, lastHostY = int.MinValue, lastHostW, lastHostH;
         bool snapped;                    // 吸附开关（默认关，点了按钮才开）
         Rectangle snapBtn;               // 右上角"吸附"按钮
 
@@ -1299,7 +1599,7 @@ namespace DshPiano
                 snapped = !snapped;
                 ApplyDragLock(snapped);
                 ApplyTopMost(snapped);
-                SaveSnapSetting();
+                SaveStateSetting();
                 NotifySnap();
                 Audio.Log("SNAP " + (snapped ? "on" : "off"));
                 if (snapped)
@@ -1493,28 +1793,108 @@ namespace DshPiano
             }
         }
 
-        /// <summary>读上次的吸附状态。文件不存在或格式坏了都按 false 处理。</summary>
-        static bool LoadSnapSetting()
+        /// <summary>
+        /// 读整个设置文件。
+        /// 早先这里是字符串查找 "snapped":true，写的时候又硬编码整个 JSON ——
+        /// 加第二个字段就会互相覆盖。现在统一按字典读写，字段各存各的。
+        /// </summary>
+        static Dictionary<string, object> LoadSettings()
         {
             try
             {
                 string p = SettingsPath;
-                if (!File.Exists(p)) return false;
+                if (!File.Exists(p)) return new Dictionary<string, object>();
                 string txt = File.ReadAllText(p);
-                return txt.IndexOf("\"snapped\":true", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (string.IsNullOrWhiteSpace(txt)) return new Dictionary<string, object>();
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var d = ser.Deserialize<Dictionary<string, object>>(txt);
+                return d ?? new Dictionary<string, object>();
             }
-            catch { return false; }
+            catch { return new Dictionary<string, object>(); }
         }
 
-        /// <summary>记住吸附状态，下次启动沿用。</summary>
-        void SaveSnapSetting()
+        static void SaveSettings(Dictionary<string, object> d)
         {
             try
             {
-                File.WriteAllText(SettingsPath,
-                    "{\"snapped\":" + (snapped ? "true" : "false") + "}");
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                File.WriteAllText(SettingsPath, ser.Serialize(d));
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 读上次的吸附状态。缺字段按 **true**（默认吸附）。
+        ///
+        /// 默认吸附而不是默认浮着：钢琴是挂在 DSH 上的附属窗口，
+        /// 浮着会盖住内容、还会随 DSH 移动脱节。默认贴上去更符合直觉。
+        /// </summary>
+        static bool LoadSnapSetting()
+        {
+            var d = LoadSettings();
+            object v;
+            // 不用 C# 7 的 `v is bool b` —— 这里编译用的是 .NET 4.0 的 csc（C# 5）
+            if (!d.TryGetValue("snapped", out v) || v == null) return true;
+            try { return Convert.ToBoolean(v, CultureInfo.InvariantCulture); }
+            catch { return true; }
+        }
+
+        /// <summary>
+        /// 强制音色。settings.json 里写了 forceProgram 就锁死成这个值，
+        /// 忽略 MIDI 文件自带的 Program Change。
+        ///
+        /// 用途：有些 MIDI 每轨开头都发 prog=0（钢琴），想用大提琴拉一遍
+        /// 就只能强制覆盖。缺字段或写 -1 表示不强制。
+        /// </summary>
+        internal static int LoadForceProgramSetting()
+        {
+            var d = LoadSettings();
+            object v;
+            if (!d.TryGetValue("forceProgram", out v) || v == null) return -1;
+            try
+            {
+                int n = Convert.ToInt32(v, CultureInfo.InvariantCulture);
+                return (n >= 0 && n <= 127) ? n : -1;
+            }
+            catch { return -1; }
+        }
+
+        /// <summary>读上次的乐器号。缺字段按 0（三角钢琴）。</summary>
+        internal static int LoadProgramSetting()
+        {
+            var d = LoadSettings();
+            object v;
+            if (!d.TryGetValue("program", out v) || v == null) return 0;
+            try { return Math.Max(0, Math.Min(127, Convert.ToInt32(v, CultureInfo.InvariantCulture))); }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// 把 forceProgram 从 settings.json 里摘掉。
+        /// 只影响这一个字段，snapped / program 原样保留。
+        /// </summary>
+        internal static void ClearForceProgramSetting()
+        {
+            try
+            {
+                var d = LoadSettings();
+                if (!d.ContainsKey("forceProgram")) return;
+                d.Remove("forceProgram");
+                SaveSettings(d);
+            }
+            catch { }
+        }
+
+        /// <summary>把当前状态写回设置文件。</summary>
+        void SaveStateSetting()
+        {
+            var d = LoadSettings();
+            d["snapped"] = snapped;
+            d["program"] = GmEngine.CurrentProgram;
+            d["bank"] = GmEngine.CurrentBank;
+            // 故意不写 forceProgram：它不是持久状态，写回去会卡住音色切换
+            d.Remove("forceProgram");
+            SaveSettings(d);
         }
 
         void NotifySnap()
@@ -1562,8 +1942,47 @@ namespace DshPiano
 
         protected override void WndProc(ref Message m)
         {
+            // ── 拦截 WM_WINDOWPOSCHANGING ──
+            //
+            // 这个是"窗口跑到屏幕外又被拉回来"的元凶。
+            //
+            // WinForms / 系统在这个消息里做"可见性修正"：窗口顶超出工作区时，
+            // 会自动把它往下推回可见区域。我们用 SetWindowPos 设了 y=-70，
+            // 系统随后自己发一次 WINDOWPOSCHANGING 把它改回 y=40
+            // （40 = DSH 的 DWM 边框顶）。
+            //
+            // 实测证据：
+            //   SETCHECK  want T=-70 got T=-70  ✓
+            //   LATECHECK t0=-70 now=40  ← 250ms 内被改了
+            //
+            // 处理办法：吸附状态下，只要目标位置是我们自己算的，
+            // 就把结构体里的标记按原样提交（不修改 x/y），系统就不会重新定位。
+            //
+            // 只在我们"贴上方且允许穿出"时拦，平时不干预 ——
+            // 否则用户手动拖窗口也会被卡住。
+            const int WM_WINDOWPOSCHANGING = 0x0046;
+            if (m.Msg == WM_WINDOWPOSCHANGING && snapped && allowOffscreen)
+            {
+                var wp = (WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(WINDOWPOS));
+                // 把 flags 里的 SWP_NOMOVE 打上，等于告诉系统"位置别动"
+                wp.flags |= SWP_NOMOVE_NATIVE;
+                Marshal.StructureToPtr(wp, m.LParam, false);
+            }
             base.WndProc(ref m);
         }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct WINDOWPOS
+        {
+            public IntPtr hwnd, hwndInsertAfter;
+            public int x, y, cx, cy;
+            public uint flags;
+        }
+
+        /// <summary>吸附时允许窗口穿出屏幕顶（上方空间不足时自动置 true）。</summary>
+        bool allowOffscreen;
+
+        const int SWP_NOMOVE_NATIVE = 0x0002;
 
         protected override void OnResize(EventArgs e)
         {
@@ -1627,12 +2046,28 @@ namespace DshPiano
 
             string api = "http://127.0.0.1:60420/api/dsh-piano-xz";
             int height = 190;
-            for (int i = 0; i < args.Length - 1; i++)
+            PianoForm.SnapArg = null;   // --snap 1/0：宿主显式指定，优先于 settings.json
+
+            // --render-only：不起窗口、不发声、不碰 waveOut，
+            // 只做一件事 —— 从宿主取渲染任务、算出 WAV、回报、退出。
+            //
+            // 为什么需要这个模式：导出（piano_export）和"窗口开没开"是两件事。
+            // 为了导出硬要把钢琴窗口弹出来，用户会觉得莫名其妙。
+            bool renderOnly = false;
+            // 循环到 args.Length（不是 Length - 1）——
+            // 原来写 -1 是为了防止 args[i+1] 越界，但那样**最后一个参数永远读不到**。
+            // --render-only 是个"没有值"的开关，放在最后就被跳过了，
+            // 于是 EXE 建了窗口、没进渲染分支，导出静默失败。
+            for (int i = 0; i < args.Length; i++)
             {
-                if (args[i] == "--api") api = args[i + 1];
-                if (args[i] == "--height") int.TryParse(args[i + 1], out height);
-                if (args[i] == "--record") Audio.RecordPath = args[i + 1];
-                if (args[i] == "--sound") Audio.SoundEnabled = true;   // 不加则只显示、不出声（由浏览器发声）
+                string a = args[i];
+                bool hasNext = i + 1 < args.Length;
+                if (a == "--api" && hasNext) api = args[i + 1];
+                else if (a == "--height" && hasNext) int.TryParse(args[i + 1], out height);
+                else if (a == "--record" && hasNext) Audio.RecordPath = args[i + 1];
+                else if (a == "--sound") Audio.SoundEnabled = true;   // 不加则只显示、不出声（由浏览器发声）
+                else if (a == "--snap" && hasNext) PianoForm.SnapArg = args[i + 1] != "0";
+                else if (a == "--render-only") renderOnly = true;
             }
 
             // 高度上限：宿主侧如果还是旧代码，会传 --height 300，
@@ -1684,6 +2119,61 @@ namespace DshPiano
                     // 那套已经被取代，加载它只会在日志里留一行"波表 0 samples"。
                     var loaded = Audio.Load(wavDir);
                     Audio.Log("音源 " + loaded);
+
+                    // GM 多乐器：有导出好的索引就加载，没有就纯钢琴
+                    var gmIndex = Path.GetFullPath(Path.Combine(exeDir, "..", "assets", "gm", "out", "index.json"));
+                    if (File.Exists(gmIndex))
+                    {
+                        var gmInfo = GmEngine.Load(gmIndex);
+
+                        // ── 启动时谁来定音色 ──
+                        //
+                        // 这里有个坑：settings.json 存的是"上次用的"，而宿主 /preset
+                        // 存的是"当前用的"。两个都可能对：
+                        //   · DSH 重启过 → 宿主 gmPreset 回到 0，这时该用 settings.json
+                        //   · 只是钢琴窗口重启 → 宿主还记得用户选的，该用它
+                        //
+                        // 原来的写法是"启动就直接 SetProgram(settings 里的值)"，
+                        // 然后轮询发现宿主是别的值又切回去 ——
+                        // 结果是"我刚设成 10，一启动又变 20"，看起来像音色记不住。
+                        //
+                        // 现在的策略：启动先按 settings 恢复（界面别跳），
+                        // 但把 savedProg 记下来；第一次轮询如果发现宿主有明确设置，
+                        // 以宿主为准并覆盖 settings（宿主是权威）。
+                        PianoForm.forceProgram = PianoForm.LoadForceProgramSetting();
+                        int savedProg = PianoForm.forceProgram >= 0
+                            ? PianoForm.forceProgram
+                            : PianoForm.LoadProgramSetting();
+                        PianoForm.pendingRestoreProgram = savedProg;
+                        if (savedProg != 0) GmEngine.SetProgram(savedProg);
+
+                        // forceProgram 是"这一次启动锁死音色"的临时开关，
+                        // 读完就把它从 settings.json 里删掉。
+                        //
+                        // 为什么必须删：它一旦留在文件里，每次启动都会强制，
+                        // 于是 piano_instrument / 网页下拉框全都切不动 ——
+                        // 而且日志里只有一行 [强制]，用户完全不知道是被什么卡住的。
+                        // 之前调试大提琴时留下了 forceProgram:73，就是这个坑。
+                        if (PianoForm.forceProgram >= 0)
+                            PianoForm.ClearForceProgramSetting();
+                        Audio.Log("GM " + gmInfo + "  program=" + GmEngine.CurrentProgram
+                                  + " (" + (GmEngine.Current != null ? GmEngine.Current.Name : "?") + ")"
+                                  + (PianoForm.forceProgram >= 0 ? " [强制]"
+                                     : savedProg != 0 ? " [沿用上次]" : ""));
+                    }
+                    else
+                    {
+                        Audio.Log("GM 未导出（缺 " + gmIndex + "），只用钢琴");
+                    }
+
+                    if (renderOnly)
+                    {
+                        // 渲染模式不打开 waveOut —— 只算，不播。
+                        Audio.Log("RENDER-ONLY 模式启动");
+                        RunRenderOnly(api);
+                        return;
+                    }
+
                     Audio.Start();
                     Audio.StartRecord();   // --record 时把混音原样录下来（诊断用）
                 }
@@ -1699,6 +2189,101 @@ namespace DshPiano
                     Audio.StopRecord();
                 }
             }
+        }
+
+        /// <summary>
+        /// 最简单的 GET（Program 类里没有 PianoForm.Fetch，也不该依赖那个实例方法）。
+        /// 只用于拿渲染任务。
+        /// </summary>
+        static string GetJson(string url)
+        {
+            var req = (System.Net.HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = 8000;
+            req.ReadWriteTimeout = 8000;
+            req.ServicePoint.Expect100Continue = false;
+            using (var resp = req.GetResponse())
+            using (var sr = new StreamReader(resp.GetResponseStream()))
+                return sr.ReadToEnd();
+        }
+
+        /// <summary>
+        /// 渲染专用循环：不问 UI，只等宿主的渲染任务。
+        ///
+        /// 流程：轮询 /render/pending → 拿到 {id, out, timeline} → RenderToWav
+        ///      → POST /render/done 回报 → 退出。
+        ///
+        /// 拿不到任务就等（最多 30 秒），超时自己退出 ——
+        /// 免得用户取消导出后留下一个僵尸进程。
+        /// </summary>
+        static void RunRenderOnly(string api)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            int polls = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(400);
+                polls++;
+                string json = null;
+                try { json = GetJson(api + "/render/pending"); }
+                catch (Exception ex)
+                {
+                    Audio.Log("RENDER-ONLY fetch fail " + ex.Message);
+                    continue;
+                }
+                if (string.IsNullOrEmpty(json) || json.IndexOf("\"id\"") < 0) continue;
+
+                try
+                {
+                    var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                    var root = ser.Deserialize<Dictionary<string, object>>(json);
+                    if (root == null || !root.ContainsKey("id")) continue;
+                    object idObj = root["id"];
+                    if (idObj == null) continue;
+
+                    string rid = Convert.ToString(idObj);
+                    string outPath = root.ContainsKey("out") ? Convert.ToString(root["out"]) : "";
+                    var tl = root.ContainsKey("timeline") ? root["timeline"] as System.Collections.IList : null;
+                    if (string.IsNullOrEmpty(rid) || tl == null || tl.Count == 0 || outPath.Length == 0) continue;
+
+                    Audio.Log("RENDER-ONLY start id=" + rid + " notes=" + tl.Count + " out=" + outPath);
+                    double sec = 0;
+                    try { sec = Audio.RenderToWav(outPath, tl); }
+                    catch (Exception rex)
+                    {
+                        Audio.Log("RENDER-ONLY fail " + rex.GetType().Name + ": " + rex.Message);
+                    }
+
+                    // 回报
+                    string body = "{\"id\":" + ser.Serialize(rid)
+                                + ",\"ok\":" + (sec > 0 ? "true" : "false")
+                                + ",\"seconds\":" + sec.ToString("0.00", CultureInfo.InvariantCulture) + "}";
+                    try
+                    {
+                        var req = (System.Net.HttpWebRequest)WebRequest.Create(api + "/render/done");
+                        req.Method = "POST";
+                        req.ContentType = "application/json";
+                        req.Timeout = 15000;
+                        req.ReadWriteTimeout = 15000;
+                        req.ServicePoint.Expect100Continue = false;
+                        var bb = System.Text.Encoding.UTF8.GetBytes(body);
+                        req.ContentLength = bb.Length;
+                        using (var st = req.GetRequestStream()) st.Write(bb, 0, bb.Length);
+                        using (var rr = req.GetResponse()) { }
+                        Audio.Log("RENDER-ONLY callback ok " + body);
+                    }
+                    catch (Exception cex)
+                    {
+                        Audio.Log("RENDER-ONLY callback FAIL " + cex.Message);
+                    }
+                    return;   // 干完就退
+                }
+                catch (Exception ex)
+                {
+                    Audio.Log("RENDER-ONLY parse fail " + ex.GetType().Name + ": " + ex.Message);
+                }
+            }
+            Audio.Log("RENDER-ONLY 超时退出（轮询 " + polls + " 次没拿到任务）");
         }
     }
 }

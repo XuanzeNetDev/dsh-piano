@@ -1,8 +1,8 @@
 {
   "name": "dsh-piano-xz",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
-  "description": "璇泽科技 · DSH 电脑钢琴：标准 88 键钢琴，AI 用工具弹，网页右下角看得见也听得见",
+  "description": "璇泽科技 · DSH 电脑钢琴：标准 88 键钢琴 + GM 128 音色，AI 用工具弹，网页右下角看得见也听得见",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -16,12 +16,19 @@
     "index.js",
     "client.js",
     "lib",
-    "assets",
+    "assets/yup",
+    "assets/piano",
+    "assets/gm/*.sf3",
     "scores",
+    "tools/sf2_parse.py",
+    "tools/extract_gm.py",
+    "tools/verify_gm.mjs",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "COMMERCIAL.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -36,6 +43,6 @@
     }
   },
   "os": ["win32", "darwin", "linux"],
-  "keywords": ["dsh", "dsh-plugin", "钢琴", "piano", "音乐"],
+  "keywords": ["dsh", "dsh-plugin", "钢琴", "piano", "音乐", "midi", "general-midi", "乐器", "instruments", "soundfont"],
   "license": "SEE LICENSE IN LICENSE"
 }

@@ -14,6 +14,14 @@ assets/yup/*.zip
 assets/wav/
 assets/mdapiano-wavetable-raw.bin
 
+# ── GM 多乐器 ──
+# FluidR3Mono_GM.sf3（22MB）入库：它是所有非钢琴音色的唯一来源。
+# 导出的 WAV 不入库：128 个乐器全导约 2.5GB，而且随时能用
+#   python tools/extract_gm.py
+# 从 sf3 重新生成。用户拿到仓库后跑一次就有。
+assets/gm/out/
+assets/gm/out-old/
+
 # ── 运行时产物 ──
 record/
 *.log

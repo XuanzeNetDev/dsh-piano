@@ -53,10 +53,10 @@ const sampleCache = new Map()
 /** 诊断计数（/events 被轮询了多少次）。 */
 const probe = { ticks: 0 }
 /**
- * 每个客户端的已发游标（key = User-Agent 前缀）。
- * 用来兜住"浏览器传 since=0 反复要同一批事件"那个 bug。
+ * 注意：这里原来有一个「按 UA 分桶记住游标」的 Map，用来兜老版本 client 传 since=0 的病。
+ * 它反而把现役 client 变成"永远回空"，已经连同 /events 里的用法一起删掉。
+ * 若将来真需要防重发，应该在 client 里守住游标，而不是在宿主侧吞事件。
  */
-const cursors = new Map()
 const LOG_FILE = join(PKG_ROOT, 'record', 'piano.log')
 
 /**
@@ -111,6 +111,36 @@ ${SCORE_FORMAT}
 const PIECE_DESCRIPTION = `用内置曲子弹一首（小星星、两只老虎、欢乐颂、生日快乐、致爱丽丝、铃儿响叮当、卡农和弦、茉莉花）。
 name 可以是标题、id 或别名，也可以只给关键词。自己编谱用 piano_score / piano_play。`
 
+const INSTRUMENT_DESCRIPTION = [
+  '切换发声乐器（General MIDI 128 音色）。',
+  '',
+  '弹出来的音不再固定是钢琴：0=三角钢琴，40=小提琴，48=弦乐合奏，56=小号，',
+  '73=长笛，24=尼龙弦吉他，32=贝斯，128 个音色按 GM 标准编号。',
+  '',
+  '用法：',
+  '  { program: 40 }        —— 按编号选',
+  '  { name: "violin" }     —— 按名字模糊匹配（大小写不敏感）',
+  '  { list: true }         —— 列出全部 128 个',
+  '',
+  '切换只影响之后的音，已经在响的音不受影响。',
+  '注意：需要先跑过 tools/extract_gm.py 导出采样，否则乐器库是空的。',
+].join('\n')
+
+const EXPORT_DESCRIPTION = [
+  '把当前队列里的曲子渲染成 WAV 文件。',
+  '',
+  '离线渲染，不走扬声器 —— 比你听到的快得多（一两分钟的歌几秒钟就好），',
+  '而且结果确定、可复现。音色、包络、循环用的都是演奏时那套代码。',
+  '',
+  '用法：',
+  '  {}                          —— 渲染当前队列，文件名用时间戳',
+  '  { file: "我的曲子.wav" }     —— 指定文件名',
+  '  { wait: false }             —— 只排队不等结果',
+  '',
+  '输出在 record/ 目录。队列里有什么就渲染什么，所以要先弹一首。',
+  '要 MP3 的话把扩展名写成 .mp3，之后可以用 ffmpeg 转（内置不直接生成 MP3）。',
+].join('\n')
+
 const STOP_DESCRIPTION = '让钢琴立刻静音：清空还没弹的音符，掐掉正在响的音。'
 
 const MIDI_DESCRIPTION = `直接弹一份标准 MIDI 文件（.mid / .midi）—— 首选方式。
@@ -138,8 +168,410 @@ const STATUS_DESCRIPTION = '看钢琴当前状态：队列、下一个音、上�
  * @param {{ leadMs?: number, maxVoices?: number }} [config]
  */
 let popupOpen = false
-let snapOn = false
+let snapOn = true    // 默认吸附（和 DSH 一体，不覆盖内容）
 let snapH = 190
+
+/**
+ * 本机 origin。webServer 注入的时候记一次，工具执行时用它拼 EXE 的 --api。
+ * 拿不到就空字符串，ensureWindow 会因此跳过（非 Windows 或环境异常）。
+ */
+let hostOrigin = ''
+
+/**
+ * 当前 GM 乐器。null 表示"没切过"，EXE 用它自己的默认（program 0）。
+ * 浏览器端和 EXE 端通过 /preset 对齐：谁改了都推到这里，另一边轮询跟上。
+ */
+let gmPreset = { bank: 0, program: 0, name: 'Grand Piano' }
+
+/**
+ * 离线渲染任务。EXE 每秒轮询 /render/pending 来取。
+ *
+ * 为什么让 EXE 渲染而不是在 Node 里合成：
+ *   音色、包络、滤波、循环全在 PianoAudio.cs 里，Node 那边没有。
+ *   在 Node 里重写一遍合成器，等于维护两套，导出的声音必然和听到的不一样。
+ *   EXE 已经有 RenderToWav()，直接复用同一套 Voice/混音代码。
+ */
+let renderJob = null   // { id, out, timeline, startedAt }
+
+/**
+ * GM 标准 128 个音色的名称表（程序号即数组下标）。
+ * 来自 FluidR3Mono_GM.sf3 的 bank 0，按 program 排序。
+ * 第 10 通道（ch 10）的鼓组不在这张表里 —— 那是另一套映射。
+ */
+const GM_INSTRUMENTS = [
+  "Grand Piano",
+  "Bright Grand Piano",
+  "Electric Grand",
+  "Honky-Tonk Piano",
+  "Tine Electric Piano",
+  "FM Electric Piano",
+  "Harpsichord",
+  "Clavinet",
+  "Celesta",
+  "Glockenspiel",
+  "Music Box",
+  "Vibraphone",
+  "Marimba",
+  "Xylophone",
+  "Tubular Bells",
+  "Dulcimer",
+  "Drawbar Organ",
+  "Percussive Organ",
+  "Rock Organ",
+  "Church Organ",
+  "Reed Organ",
+  "Accordion",
+  "Harmonica",
+  "Bandoneon",
+  "Nylon String Guitar",
+  "Steel String Guitar",
+  "Jazz Guitar",
+  "Clean Guitar",
+  "Palm Muted Guitar",
+  "Overdrive Guitar",
+  "Distortion Guitar",
+  "Guitar Harmonics",
+  "Acoustic Bass",
+  "Fingered Bass",
+  "Picked Bass",
+  "Fretless Bass",
+  "Slap Bass",
+  "Pop Bass",
+  "Synth Bass 1",
+  "Synth Bass 2",
+  "Violin",
+  "Viola",
+  "Cello",
+  "Contrabass",
+  "Tremolo Strings",
+  "Pizzicato Strings",
+  "Harp",
+  "Timpani",
+  "Strings",
+  "Slow Strings",
+  "Synth Strings 1",
+  "Synth Strings 2",
+  "Choir Aahs",
+  "Voice Oohs",
+  "Synth Voice",
+  "Orchestra Hit",
+  "Trumpet",
+  "Trombone",
+  "Tuba",
+  "Harmon Mute Trumpet",
+  "French Horns",
+  "Brass Section",
+  "Synth Brass 1",
+  "Synth Brass 2",
+  "Soprano Sax",
+  "Alto Sax",
+  "Tenor Sax",
+  "Baritone Sax",
+  "Oboe",
+  "English Horn",
+  "Bassoon",
+  "Clarinet",
+  "Piccolo",
+  "Flute",
+  "Recorder",
+  "Pan Flute",
+  "Bottle Chiff",
+  "Shakuhachi",
+  "Whistle",
+  "Ocarina",
+  "Square Lead",
+  "Saw Lead",
+  "Calliope Lead",
+  "Chiffer Lead",
+  "Charang",
+  "Solo Vox",
+  "5th Saw Wave",
+  "Bass & Lead",
+  "Fantasia",
+  "Warm Pad",
+  "Polysynth",
+  "Space Voice",
+  "Bowed Glass",
+  "Metal Pad",
+  "Halo Pad",
+  "Sweep Pad",
+  "Ice Rain",
+  "Soundtrack",
+  "Crystal",
+  "Atmosphere",
+  "Brightness",
+  "Goblin",
+  "Echo Drops",
+  "Star Theme",
+  "Sitar",
+  "Banjo",
+  "Shamisen",
+  "Koto",
+  "Kalimba",
+  "Bagpipe",
+  "Fiddle",
+  "Shenai",
+  "Tinker Bell",
+  "Agogo",
+  "Steel Drums",
+  "Woodblock",
+  "Taiko Drum",
+  "Melodic Tom",
+  "Synth Drum",
+  "Reverse Cymbal",
+  "Fret Noise",
+  "Breath Noise",
+  "Sea Shore",
+  "Bird Tweet",
+  "Telephone",
+  "Helicopter",
+  "Applause",
+  "Gun Shot",
+]
+
+
+/**
+ * ── 模块级：独立窗口的启动 ──
+ *
+ * 为什么放在模块级而不是 apply() 里：
+ * handle() 是模块级函数，拿不到 apply() 内部的局部变量。
+ * 之前 ensureWindow 定义在 apply 里，handle 里引用就报
+ * "ensureWindow is not defined" —— 而且因为 ESM 模块缓存，
+ * 改完代码重启也未必立刻生效，排查起来极其费劲。
+ *
+ * 这一层只用模块级状态，谁都能调。
+ */
+
+/** 是否认为窗口开着（仅作快路径，实际以进程为准）。 */
+let winSpawned = false
+
+/** 最近一次 getOrigin 拿到的地址。 */
+let winOrigin = ''
+
+/** 吸附状态（模块级，供启动时用）。 */
+let winSnapOn = true
+let winSnapH = 190
+
+/** 写一行诊断日志到 record/window.log。 */
+export function winLog(line) {
+  try {
+    mkdirSync(join(PKG_ROOT, 'record'), { recursive: true })
+    appendFileSync(
+      join(PKG_ROOT, 'record', 'window.log'),
+      new Date().toISOString().slice(11, 23) + ' ' + line + '\n',
+    )
+  } catch {}
+}
+
+/** 真有 PianoWindow.exe 在跑吗（按进程名查）。 */
+export function isPianoRunning() {
+  try {
+    const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq PianoWindow.exe', '/NH'], {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 3000,
+    })
+    const out = String(r?.stdout || '')
+    return /PianoWindow\.exe/i.test(out)
+  } catch {
+    return false
+  }
+}
+
+/** origin 拿不到时兜底：从进程监听端口推一个。 */
+export function guessOrigin() {
+  try {
+    const envPort = process.env.DSH_WEB_PORT || process.env.PORT
+    if (envPort && /^\d+$/.test(String(envPort))) {
+      return 'http://127.0.0.1:' + envPort
+    }
+    const r = spawnSync('netstat', ['-ano'], { windowsHide: true, encoding: 'utf8', timeout: 4000 })
+    const out = String(r?.stdout || '')
+    const re = new RegExp('127\\.0\\.0\\.1:(\\d+)\\s+0\\.0\\.0\\.0:0\\s+LISTENING\\s+' + process.pid + '\\b')
+    const m = out.match(re)
+    return m ? 'http://127.0.0.1:' + m[1] : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 确保独立窗口存在（模块级版本，handle 也能调）。
+ * @param {string} [origin]
+ * @param {{ snapOn?: boolean, snapH?: number }} [opts]
+ * @returns {boolean}
+ */
+/**
+ * 确保「有东西能渲染」。
+ *
+ * 和 ensureWindowModule 的区别：
+ *   · ensureWindowModule 要**可见窗口**（用户要看要弹）
+ *   · 这个只要**有进程能算**（导出）
+ *
+ * 顺序：
+ *   1. 已经有 PianoWindow.exe 在跑 → 直接用（省一次启动）
+ *   2. 没有 → spawn 一个 --render-only 实例，它不建窗口、不碰 waveOut，
+ *      取到任务、渲染完、自己退出
+ *
+ * 这样导出就跟"窗口开没开""有没有在播""吸不吸附"全都无关了。
+ *
+ * @param {string} origin
+ * @returns {boolean}
+ */
+export function ensureRenderer(origin) {
+  if (process.platform !== 'win32') {
+    winLog('ensureRenderer: 非 win32')
+    return false
+  }
+  const exe = join(PKG_ROOT, 'tools', 'PianoWindow.exe')
+  if (!existsSync(exe)) {
+    winLog('ensureRenderer: 找不到 ' + exe)
+    return false
+  }
+
+  // 已有实例在跑（不管它是窗口还是上一次的渲染进程）——复用它
+  if (isPianoRunning()) {
+    winLog('ensureRenderer: 已有实例在跑，复用它')
+    return true
+  }
+
+  let base = origin || winOrigin || ''
+  if (!base) {
+    base = guessOrigin()
+    winLog('ensureRenderer: origin 为空，推断得到 ' + (base || '(失败)'))
+    if (!base) return false
+  }
+  winOrigin = base
+
+  try {
+    winLog('ensureRenderer: 启动 render-only 实例, api=' + base + ROUTE)
+    spawn(exe, ['--api', base + ROUTE, '--render-only'], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    }).unref()
+    return true
+  } catch (e) {
+    winLog('ensureRenderer: spawn 失败 ' + String(e?.message || e))
+    return false
+  }
+}
+
+export function ensureWindowModule(origin, opts = {}) {
+  if (process.platform !== 'win32') {
+    winLog('ensureWindow: 非 win32')
+    return false
+  }
+
+  // ── 先看进程，再看 origin ──
+  //
+  // 顺序很重要：窗口已经在跑的时候，根本不需要 origin（那是"启动参数"用的）。
+  // 原来先检查 origin，拿不到就直接 return false ——
+  // 表现是"EXE 明明开着，导出却报'起不了钢琴窗口'"。
+  if (isPianoRunning()) {
+    winSpawned = true
+    return true
+  }
+  if (winSpawned) {
+    winLog('ensureWindow: 标志说开着，但进程不在 —— 纠正')
+    winSpawned = false
+  }
+
+  const exe = join(PKG_ROOT, 'tools', 'PianoWindow.exe')
+  if (!existsSync(exe)) {
+    winLog('ensureWindow: 找不到 ' + exe)
+    return false
+  }
+
+  let base = origin || winOrigin || ''
+  if (!base) {
+    base = guessOrigin()
+    winLog('ensureWindow: origin 为空，推断得到 ' + (base || '(失败)'))
+    if (!base) return false
+  }
+  winOrigin = base
+
+  const snapOn = opts.snapOn ?? winSnapOn
+  const snapH = opts.snapH ?? winSnapH
+  try {
+    winSpawned = true
+    const fullApi = base + ROUTE
+    winLog('ensureWindow: 启动 exe, api=' + fullApi + ' snap=' + (snapOn ? '1' : '0'))
+    spawn(exe, ['--api', fullApi, '--height', String(snapH), '--snap', snapOn ? '1' : '0'], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false,
+    }).unref()
+    return true
+  } catch (e) {
+    winLog('ensureWindow: spawn 失败 ' + String(e?.message || e))
+    winSpawned = false
+    return false
+  }
+}
+
+/**
+ * 默认导出目录：**Windows 的下载文件夹**。
+ *
+ * 之前用插件的 record/，用户根本找不到（藏在插件目录里）。
+ * 导出的东西是"作品"，应该落在用户自然会去的地方。
+ *
+ * 顺序：
+ *   1. 系统已知的 Downloads 文件夹（被 OneDrive 重定向也能拿到）
+ *   2. 环境变量 USERPROFILE\\Downloads
+ *   3. 退回插件 record/（极少数环境两者都没有）
+ */
+function defaultExportDir() {
+  try {
+    const home = process.env.USERPROFILE || process.env.HOME || ''
+    if (process.platform === 'win32') {
+      const r = spawnSync(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command',
+         "[Environment]::GetFolderPath('UserProfile') + '\\Downloads'"],
+        { windowsHide: true, encoding: 'utf8', timeout: 4000 },
+      )
+      const p1 = String(r?.stdout || '').trim()
+      if (p1 && existsSync(p1)) return p1
+    }
+    if (home) {
+      const p2 = join(home, 'Downloads')
+      if (existsSync(p2)) return p2
+      return home
+    }
+  } catch {}
+  return join(PKG_ROOT, 'record')
+}
+
+/**
+ * 解析导出路径。
+ *
+ * 默认落在**系统下载文件夹**。不能用 process.cwd()：
+ * DSH 的工作目录是 profile 目录（…\\.dsh\\profiles\\desktop），
+ * 写那儿用户根本找不到，而且换个 profile 就换个地方。
+ *
+ * 也支持绝对路径（用户想导到 D 盘某处）。
+ *
+ * @param {unknown} rawFile 文件名或完整路径
+ * @param {unknown} rawDir  目录（可选）
+ * @returns {{ out: string, name: string, dir: string }}
+ */
+function resolveExportPath(rawFile, rawDir) {
+  let name = String(rawFile || '').trim()
+  if (!name) name = 'render-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
+
+  const looksAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || name.startsWith('\\\\') || name.startsWith('/')
+  if (!looksAbsolute) name = name.replace(/[\\/:*?"<>|]/g, '_')
+  if (!/\\.(wav|mp3)$/i.test(name)) name += '.wav'
+
+  let dir = String(rawDir || '').trim()
+  if (!dir) dir = defaultExportDir()
+  else if (!isAbsolute(dir)) dir = resolve(PKG_ROOT, dir)
+
+  const out = looksAbsolute ? name : join(dir, name)
+  try { mkdirSync(dirname(out), { recursive: true }) } catch {}
+  return { out, name: basename(out), dir: dirname(out) }
+}
 
 export function apply(ctx, config = {}) {
   const engine = createEngine({ leadMs: config?.leadMs, maxVoices: config?.maxVoices })
@@ -155,6 +587,16 @@ export function apply(ctx, config = {}) {
       throw new NoteError(`一次最多 ${MAX_NOTES_PER_CALL} 个音（这份有 ${parsed.notes.length} 个），拆成几段。`)
     }
     const timeline = toTimeline(parsed, { tempo: parsed.tempo, gapRatio: clampGap(options.gap) })
+    // ── 先停，再排 ──
+    // engine.schedule 的 base 是 Math.max(now+lead, last.t)，也就是"接在上一段
+    // 结束之后排"。不先停的话，连着弹两次，第二次会等到第一次放完才响 ——
+    // 用户看到的现象就是"点了没反应，过一会儿才响"。
+    //
+    // 这里是所有"发命令就立刻响"的统一切口：谱文本、文件、MIDI 都经过 playText
+    // 或它旁边的调度，所以在这一层停一次就够，不用每个工具各写一遍。
+    engine.stop()
+    // 没起窗口就先起 —— 否则音排了但没人放，用户看到的是"点了没反应"
+    ensureWindowModule(hostOrigin)
     const result = engine.schedule(timeline, { label: options.label ?? '乐谱', tempo: parsed.tempo })
     return { parsed, timeline, result }
   }
@@ -300,6 +742,7 @@ export function apply(ctx, config = {}) {
           // 排新曲之前必须清空队列：上一次弹奏的未来音还挂在里面，
           // 叠在一起就"挤在同一时间段全响"，听感正是"播放特别快"。
           engine.stop()
+          ensureWindowModule(hostOrigin)
           const result = engine.schedule(timeline, { label: basename(target), tempo: null, score })
           const notes = timeline.slice(0, 14).map((n) => noteName(n.midi)).join(' ')
           const extra = [
@@ -459,11 +902,159 @@ export function apply(ctx, config = {}) {
         }
       },
     })
+
+    c.tools.register({
+      name: 'piano_instrument',
+      description: INSTRUMENT_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          program: { type: 'number', description: 'GM 音色号 0-127（0=三角钢琴，40=小提琴，48=弦乐合奏，56=小号…）' },
+          bank: { type: 'number', description: '音色库号，默认 0（GM 标准库）' },
+          name: { type: 'string', description: '直接按名字选（模糊匹配，如 "violin"、"弦乐"）' },
+          list: { type: 'boolean', description: '只列出可用乐器，不切换' },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['ok', 'text'],
+          properties: { ok: { type: 'boolean' }, text: { type: 'string' } },
+        },
+        render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
+      },
+      execute: async (args = {}) => {
+        const GM = GM_INSTRUMENTS
+        if (args.list) {
+          const lines = GM.map((n, i) => `${String(i).padStart(3, ' ')}  ${n}`)
+          return { ok: true, text: `可用乐器（${GM.length} 个）：\n${lines.join('\n')}` }
+        }
+
+        let program = null
+        let bank = Number.isFinite(args.bank) ? Math.max(0, Math.min(127, args.bank)) : 0
+
+        if (Number.isFinite(args.program)) {
+          program = Math.max(0, Math.min(127, Math.floor(args.program)))
+        } else if (typeof args.name === 'string' && args.name.trim()) {
+          const q = args.name.trim().toLowerCase()
+          const hit = GM.findIndex((n) => n.toLowerCase().includes(q))
+          if (hit < 0) {
+            return { ok: false, text: `没找到叫「${args.name}」的乐器。用 list: true 看全部。` }
+          }
+          program = hit
+        } else {
+          return { ok: false, text: `给个 program（0-127）或 name，或者 list: true 看清单。` }
+        }
+
+        gmPreset = { bank, program, name: GM[program] }
+        engine.stop()
+        return {
+          ok: true,
+          text: `已切到 ${program} · ${GM[program]}${bank ? `（bank ${bank}）` : ''}。下一个音就用这个音色。`,
+        }
+      },
+    })
+
+    c.tools.register({
+      name: 'piano_export',
+      description: EXPORT_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          file: { type: 'string', description: '输出文件名或完整路径。省略则用时间戳。' },
+          dir: { type: 'string', description: '输出目录（可选）。默认系统下载文件夹。' },
+          wait: { type: 'boolean', description: '是否等渲染完成（默认 true，最长 60 秒）' },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['ok', 'text'],
+          properties: { ok: { type: 'boolean' }, text: { type: 'string' } },
+        },
+        render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
+      },
+      execute: async (args = {}) => {
+        const snap = engine.snapshotForRender()
+        if (!snap.count) {
+          return { ok: false, text: '队列是空的。先 piano_play / piano_score / piano_midi 弹一首，再导出。' }
+        }
+        const id = 'r' + Date.now().toString(36)
+        const { out, name, dir } = resolveExportPath(args?.file, args?.dir)
+
+        // 渲染要靠 EXE 的音频代码，但**不需要窗口**。
+        // ensureRenderer 会在没进程时起一个 --render-only 实例（不建窗口、不发声）。
+        if (!ensureRenderer(hostOrigin)) {
+          return {
+            ok: false,
+            text: '起不了渲染进程（非 Windows，或 tools/PianoWindow.exe 不存在）。',
+          }
+        }
+
+        renderJob = { id, out, timeline: snap.timeline, startedAt: Date.now(), spanMs: snap.spanMs }
+
+        if (args?.wait === false) {
+          return { ok: true, text: `已排入渲染队列：${name}\n${snap.count} 个音，约 ${(snap.spanMs / 1000).toFixed(0)} 秒音频。\n用 piano_export({ wait: true }) 或 pip 等它完成。` }
+        }
+
+        const deadline = Date.now() + 60_000
+        while (Date.now() < deadline) {
+          if (renderJob && renderJob.done) break
+          await new Promise((r) => setTimeout(r, 300))
+        }
+        if (!renderJob || !renderJob.done) {
+          return { ok: false, text: `渲染超时（等 60 秒没完成）。看 record/audio.log 里的 RENDER 行。目标文件：${out}` }
+        }
+        if (!renderJob.ok) {
+          return { ok: false, text: `渲染失败。日志在 record/audio.log 里搜 RENDER。` }
+        }
+        return {
+          ok: true,
+          text: `导出完成：${name}\n目录 ${dir}\n文件 ${out}\n音频 ${renderJob.seconds.toFixed(1)} 秒，${snap.count} 个音。`,
+        }
+      },
+    })
   })
+
+
+
 
   ctx.inject(['webServer'], (c) => {
     const server = c.webServer || (typeof c.get === 'function' ? c.get('webServer') : undefined)
     if (!server || typeof server.register !== 'function') return
+
+    /**
+     * 立刻取一次 origin —— 不能等第一个 HTTP 请求。
+     *
+     * 之前 hostOrigin 只在 handle() 里赋值，而 handle 要等用户发请求才跑。
+     * 结果是：用户第一次调 piano_play / 选 MIDI 的时候，hostOrigin 还是空串，
+     * ensureWindow('') 直接返回 false，EXE 根本没起来 ——
+     * 表现就是"点了播放没声音，钢琴按钮还是灰的"。
+     *
+     * 现在注册成功就先取一次；取不到（老版本 webServer 没这个方法）
+     * 就在下面的轮询里补。
+     */
+    const grabOrigin = () => {
+      try {
+        const o = typeof server.getOrigin === 'function' ? server.getOrigin() : ''
+        if (o) hostOrigin = o
+        return !!o
+      } catch {
+        return false
+      }
+    }
+    grabOrigin()
+    // 有些宿主 webServer 起来得晚，兜底再试几次（总共约 5 秒）
+    if (!hostOrigin) {
+      let tries = 0
+      const timer = setInterval(() => {
+        if (grabOrigin() || ++tries > 20) clearInterval(timer)
+      }, 250)
+      // 不阻塞退出
+      if (typeof timer.unref === 'function') timer.unref()
+    }
 
     ctx.effect(
       () =>
@@ -477,6 +1068,8 @@ export function apply(ctx, config = {}) {
             } catch {
               /* 拿不到就退回相对路径 */
             }
+            if (origin) hostOrigin = origin
+            // handle 每次都会取到最新的 origin（端口可能变），顺手更新给工具用
             handle(req, res, engine, playText, origin).catch((error) => {
               try {
                 sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
@@ -621,11 +1214,15 @@ async function handle(req, res, engine, playText, origin) {
     }
   }
 
-  // 吸附状态：EXE 开启吸附时置 true，插件据此给页面留出钢琴的高度。
   // 钢琴窗口是否开着（client 用它决定胶囊按钮是"打开"还是"关闭"）
   if (method === 'GET' && path === '/popup/state') {
-    writeJson(res, 200, { ok: true, open: popupOpen })
-    return
+    // 这里原来写的是 writeJson —— index.js 里没有这个函数（兄弟路由都用 sendJson），
+    // 于是这个接口稳定 500，client 每次问都拿到错误。
+    // 用进程实检 —— 内存标志在"用户手动关窗口""EXE 崩了"之后会失准，
+    // 前端据此画按钮颜色，就不准了。
+    const running = isPianoRunning()
+    popupOpen = running
+    return sendJson(res, 200, { ok: true, open: running })
   }
 
   // 关掉钢琴窗口：胶囊按钮第二次点就走这里
@@ -638,8 +1235,162 @@ async function handle(req, res, engine, playText, origin) {
       }
     } catch {}
     popupOpen = false
-    writeJson(res, 200, { ok: true, killed })
+    sendJson(res, 200, { ok: true, killed })
     return
+  }
+
+  // 上传一个 MIDI 文件并直接播放。body 是裸二进制 .mid。
+  // 参数：name=<文件名>（只用于显示）、tempo=<倍率>
+  if (method === 'POST' && path === '/upload-midi') {
+    const buf = await readRawBody(req)
+    if (!buf || buf.length < 14) {
+      return sendJson(res, 400, { ok: false, error: '没收到文件，或者文件太小不像 MIDI。' })
+    }
+    if (buf.slice(0, 4).toString('ascii') !== 'MThd') {
+      return sendJson(res, 400, { ok: false, error: '这不是标准 MIDI 文件（缺少 MThd 头）。' })
+    }
+    const label = String(url.searchParams.get('name') || 'uploaded.mid')
+    const scale = Number(url.searchParams.get('tempo')) || 1
+    try {
+      const midi = parseMidi(buf)
+      const { timeline, seconds, dropped, clipped } = midiToTimeline(midi, { tempoScale: scale })
+      if (!timeline.length) {
+        return sendJson(res, 400, { ok: false, error: '这份 MIDI 里没有能播的音符。' })
+      }
+      if (timeline.length > MAX_NOTES_PER_CALL) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: `这份 MIDI 有 ${timeline.length} 个音，超过单次上限 ${MAX_NOTES_PER_CALL}。`,
+        })
+      }
+      const bpm = midi.tempoMap?.length ? Math.round(60_000_000 / midi.tempoMap[0].usPerQuarter) : null
+      const score = {
+        topic: 'midi',
+        file: label,
+        bpm,
+        key: midi.keySignature || null,
+        timeSig: midi.timeSignature || null,
+        transpose: 0,
+      }
+      engine.stop()
+      ensureWindowModule(origin)
+      const result = engine.schedule(timeline, { label, tempo: null, score })
+      return sendJson(res, 200, {
+        ok: true,
+        label,
+        notes: timeline.length,
+        seconds: Math.round(seconds),
+        dropped,
+        clipped,
+        bytes: buf.length,
+        ...result,
+      })
+    } catch (error) {
+      return sendJson(res, 400, { ok: false, error: '解析失败：' + String(error?.message ?? error) })
+    }
+  }
+
+
+
+  // 开始渲染：把时间轴交给 EXE，它渲染完回报。参数：file=<输出文件名>
+  if (method === 'POST' && path === '/render') {
+    // 上一个还挂着但超过 90 秒没动静 → 认为它死了，直接顶掉
+    if (renderJob && !renderJob.done && Date.now() - renderJob.startedAt > 90_000) {
+      renderJob = null
+    }
+    if (renderJob && !renderJob.done) {
+      return sendJson(res, 409, { ok: false, error: '上一个渲染还没完成：' + renderJob.id })
+    }
+    renderJob = null   // 上一个已完成，可以开新的
+    const snap = engine.snapshotForRender()
+    if (!snap.count) {
+      return sendJson(res, 400, { ok: false, error: '队列是空的，先弹一首再导出。' })
+    }
+    const id = 'r' + Date.now().toString(36)
+    const { out, name, dir } = resolveExportPath(url.searchParams.get('file'), url.searchParams.get('dir'))
+    renderJob = { id, out, timeline: snap.timeline, startedAt: Date.now(), spanMs: snap.spanMs }
+    return sendJson(res, 200, { ok: true, id, out, name, dir, notes: snap.count, seconds: Math.round(snap.spanMs / 100) / 10 })
+  }
+
+  // EXE 来取任务
+  if (method === 'GET' && path === '/render/pending') {
+    if (!renderJob) return sendJson(res, 200, { ok: true, id: null })
+
+    // 超时清掉就任务作废（原来这个判断写在"已派发"之前，
+    // 一旦派发过就永远 return id:null，卡住的旧任务再也不清）
+    if (Date.now() - renderJob.startedAt > 120_000) {
+      renderJob = null
+      return sendJson(res, 200, { ok: true, id: null, error: '超时，已丢弃' })
+    }
+    if (renderJob.dispatched) return sendJson(res, 200, { ok: true, id: null })
+    renderJob.dispatched = true
+    return sendJson(res, 200, {
+      ok: true,
+      id: renderJob.id,
+      out: renderJob.out,
+      timeline: renderJob.timeline,
+    })
+  }
+
+  // EXE 渲染完回报
+  if (method === 'POST' && path === '/render/done') {
+    const body = await readBody(req)
+    let data = {}
+    try { data = JSON.parse(body || '{}') } catch {}
+    if (renderJob && data.id === renderJob.id) {
+      renderJob.done = true
+      renderJob.ok = !!data.ok
+      renderJob.seconds = Number(data.seconds) || 0
+      renderJob.out = renderJob.out
+    }
+    return sendJson(res, 200, { ok: true })
+  }
+
+  // 查询渲染状态
+  if (method === 'GET' && path === '/render/state') {
+    if (!renderJob) return sendJson(res, 200, { ok: true, state: 'idle' })
+    return sendJson(res, 200, {
+      ok: true,
+      state: renderJob.done ? (renderJob.ok ? 'done' : 'failed') : 'running',
+      id: renderJob.id,
+      out: renderJob.out,
+      seconds: renderJob.seconds || 0,
+      elapsedMs: Date.now() - renderJob.startedAt,
+    })
+  }
+
+  // 切乐器（网页端下拉框走这里）。参数：program=0-127&bank=0-127
+  if (method === 'POST' && path === '/instrument') {
+    const q = url.searchParams
+    const raw = Number(q.get('program'))
+    if (!Number.isFinite(raw)) {
+      return sendJson(res, 400, { ok: false, error: '要给 program（0-127）' })
+    }
+    const program = Math.max(0, Math.min(127, Math.floor(raw)))
+    const bank = Math.max(0, Math.min(127, Math.floor(Number(q.get('bank')) || 0)))
+    gmPreset = { bank, program, name: GM_INSTRUMENTS[program] ?? `Program ${program}` }
+    engine.stop()
+    return sendJson(res, 200, { ok: true, ...gmPreset })
+  }
+
+  // 乐器清单（网页端下拉框初始化时取一次）
+  if (method === 'GET' && path === '/instruments') {
+    return sendJson(res, 200, {
+      ok: true,
+      current: gmPreset,
+      list: GM_INSTRUMENTS.map((name, program) => ({ program, name })),
+    })
+  }
+
+  // 当前乐器。EXE 轮询这个接口，发现变了就切 preset。
+  if (method === 'GET' && path === '/preset') {
+    return sendJson(res, 200, {
+      ok: true,
+      bank: gmPreset.bank,
+      program: gmPreset.program,
+      name: gmPreset.name,
+      available: GM_INSTRUMENTS.length,
+    })
   }
 
   if (method === 'POST' && path === '/snap') {
@@ -647,7 +1398,7 @@ async function handle(req, res, engine, playText, origin) {
     snapOn = q.get('on') === '1' || q.get('on') === 'true'
     const h = Number(q.get('h')) || 190
     snapH = Math.max(60, Math.min(400, h))
-    writeJson(res, 200, { ok: true, snap: snapOn, height: snapH })
+    sendJson(res, 200, { ok: true, snap: snapOn, height: snapH })
     return
   }
 
@@ -655,25 +1406,20 @@ async function handle(req, res, engine, playText, origin) {
     const since = Number(url.searchParams.get('since') ?? '0')
 
     /**
-     * 游标兜底。
+     * 游标：只看浏览器自己传的 since。
      *
-     * 浏览器那半边有个版本把 seq 放在 useEffect 的局部变量里，effect 一重跑就归零，
-     * 于是每秒八次带着 since=0 来要"所有事件"，同一个音被反复播放几十层 ——
-     * 听感就是一片嗡嗡。那个 bug 在 client 里，但 client bundle 没跟着更新，
-     * 所以在这里按客户端分桶记游标：它传 0 也没用，我们只给没发过的。
-     *
-     * 分桶用 User-Agent 前 40 字符：网页端是 Chrome，独立窗口是 .NET WebClient，
-     * 两者互不抢事件。
+     * 这里原来有一层「按 UA 分桶记住游标，然后 max(since, remembered)」的兜底，
+     * 本意是治老版本 client「每次传 since=0 把同一批事件反复要」的毛病。
+     * 但现役 client（client.js 和独立窗口那段内联脚本）发的**就是 since=0**：
+     * 第一次拿全量，之后 remembered 已经被推到最新 seq，于是永远回空 ——
+     * 网页端一个音都听不到，EXE 那边则是偶尔漏音。
+     * 兜底本身比 bug 更坏，去掉，尊重调用方给的游标。
      */
-    const ua = String(req.headers['user-agent'] || 'unknown').slice(0, 40)
-    const remembered = cursors.get(ua) || 0
-    const useSince = Math.max(since, remembered)
-    const snapshot = engine.drain(useSince)
-    cursors.set(ua, snapshot.seq)
+    const snapshot = engine.drain(Number.isFinite(since) && since > 0 ? since : 0)
 
     probe.ticks++
     if (probe.ticks === 1 || snapshot.events.length) {
-      probeLog(`events since=${since} used=${useSince} seq=${snapshot.seq} got=${snapshot.events.length} ua=${ua.slice(0, 18)}`)
+      probeLog(`events since=${since} seq=${snapshot.seq} got=${snapshot.events.length} ua=${String(req.headers['user-agent'] || 'unknown').slice(0, 18)}`)
     }
     return sendJson(res, 200, { ok: true, ...snapshot })
   }
@@ -947,6 +1693,34 @@ function sendHtml(res, html) {
  * 读请求体。
  * @param {import('node:http').IncomingMessage} req
  */
+/**
+ * 读二进制 body（上传 MIDI 用）。
+ *
+ * 不能复用 readBody：那个把数据当字符串拼，二进制过一遍 UTF-8 就被破坏了。
+ * 这里收到的是 Buffer 块，直接拼成一块。
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} [limit] 上限字节数，默认 8 MB（标准 MIDI 很少有超过 1 MB 的）
+ * @returns {Promise<Buffer>}
+ */
+function readRawBody(req, limit = 8 * 1024 * 1024) {
+  return new Promise((resolvePromise) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > limit) {
+        req.destroy()
+        resolvePromise(null)
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolvePromise(Buffer.concat(chunks)))
+    req.on('error', () => resolvePromise(null))
+  })
+}
+
 function readBody(req) {
   return new Promise((resolvePromise) => {
     let raw = ''

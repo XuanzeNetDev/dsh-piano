@@ -612,11 +612,20 @@ window.__ModuleLoader__.load({
       // 保险：总线瞬间静音再恢复。
       // 一首曲子的事件在开演时就全部排进 AudioContext 时间轴了（未来十几秒的音都已经
       // 调度好），光 release 单个 voice 可能漏掉几个；这里直接把总线掐一下，50ms 后恢复。
+      //
+      // 这里原来有个会永久静音的错：
+      //   setValueAtTime(0, now) 之后再来一句 setValueAtTime(1, now + 0.05) ——
+      //   两个都是「插入一个事件」，后者并不会覆盖 0 时刻那个；
+      //   而 strike() 里的 linearRampToValueAtTime(peak, …) 从 0 爬上去之后同样不回位。
+      //   于是总线一路保持在 0：点一次「停」之后，整页直到刷新都不再出声。
+      // 正确做法：先 cancelScheduledValues 清掉排定的自动化，再用 ramp 把增益拉回 1.0。
       if (ac && AUDIO.bus) {
         try {
-          AUDIO.bus.gain.cancelScheduledValues(now)
-          AUDIO.bus.gain.setValueAtTime(0, now)
-          AUDIO.bus.gain.setValueAtTime(1, now + 0.05)
+          const g = AUDIO.bus.gain
+          const target = Number.isFinite(AUDIO.volume) ? AUDIO.volume : 1
+          g.cancelScheduledValues(now)
+          g.setValueAtTime(0, now)
+          g.linearRampToValueAtTime(target, now + 0.06)
         } catch {
           /* 忽略 */
         }
@@ -677,6 +686,52 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
 
 /* 圆点：默认灰（未启动），data-on 才绿（启动中）。
    之前有一行 [data-dp-inline] 的 !important 强制绿色，把状态覆盖掉了。 */
+[data-dp-pillbox]{display:inline-flex;align-items:center;gap:4px;}
+[data-dp-instwrap]{position:relative;display:inline-flex;}
+[data-dp-inst]{display:inline-flex;align-items:center;gap:4px;height:26px;max-width:190px;
+  padding:0 8px;font-size:12px;color:inherit;background:transparent;
+  border:1px solid rgba(128,128,128,.28);border-radius:7px;cursor:pointer;
+  font-family:inherit;text-overflow:ellipsis;overflow:hidden;white-space:nowrap;}
+[data-dp-inst]:hover{background-color:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12));}
+[data-dp-inst]:disabled{opacity:.5;cursor:default;}
+[data-dp-inst-cur]{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+[data-dp-inst-arrow]{flex:none;opacity:.6;font-size:10px;}
+
+[data-dp-instmenu]{position:absolute;top:30px;left:0;z-index:300;width:260px;
+  background:#1c1f24;border:1px solid rgba(128,128,128,.28);border-radius:8px;
+  box-shadow:0 10px 28px rgba(0,0,0,.45);padding:6px;display:flex;
+  flex-direction:column;gap:4px;}
+[data-dp-instsearch]{height:26px;padding:0 8px;font-size:12px;color:inherit;
+  background:rgba(255,255,255,.05);border:1px solid rgba(128,128,128,.24);
+  border-radius:6px;outline:none;font-family:inherit;}
+[data-dp-instsearch]:focus{border-color:rgba(59,130,246,.6);}
+[data-dp-instlist]{max-height:320px;overflow-y:auto;overscroll-behavior:contain;}
+[data-dp-inst-group]{padding:6px 8px 3px;font-size:11px;opacity:.55;
+  position:sticky;top:0;background:#1c1f24;}
+[data-dp-inst-item]{display:flex;gap:8px;width:100%;padding:4px 8px;font-size:12px;
+  color:inherit;background:transparent;border:0;border-radius:5px;cursor:pointer;
+  text-align:left;font-family:inherit;}
+[data-dp-inst-item]:hover{background:rgba(128,128,128,.16);}
+[data-dp-inst-item][data-sel]{background:rgba(59,130,246,.22);}
+[data-dp-inst-num]{width:26px;flex:none;opacity:.5;font-variant-numeric:tabular-nums;}
+[data-dp-inst-name]{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+[data-dp-instempty]{padding:10px 8px;font-size:12px;opacity:.55;}
+
+[data-dp-midibox]{position:relative;display:inline-flex;align-items:center;}
+/* 文件选择框必须藏掉原生"选择文件"按钮 —— 它和旁边的「MIDI」按钮重复。
+   display:none 在部分宿主里对 input[type=file] 不生效（原生控件照常渲染），
+   所以用"零尺寸 + 绝对定位"的视觉隐藏：不占位、看不见，但 click() 仍然有效。 */
+[data-dp-midifile]{position:absolute;width:1px;height:1px;padding:0;margin:-1px;
+  overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;opacity:0;}
+[data-dp-midi]{width:52px;min-width:52px;height:26px;padding:0;font-size:12px;color:inherit;
+  text-align:center;box-sizing:border-box;
+  background:transparent;border:1px solid rgba(128,128,128,.28);border-radius:7px;
+  cursor:pointer;white-space:nowrap;font-family:inherit;
+  transition:background .15s ease;}
+[data-dp-midi]:hover{background-color:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12));}
+[data-dp-midi]:disabled{cursor:default;opacity:.7;}
+[data-dp-midi][data-busy]{border-color:rgba(59,130,246,.55);color:#7fb3ff;}
+
 [data-dp-dot]{width:7px;height:7px;border-radius:4px;background:#5b6472;flex:none;transition:background .15s ease;}
 [data-dp-dot][data-on]{background:#22c55e;animation:dp-pulse .9s ease-in-out infinite;}
 @keyframes dp-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.6);opacity:.45}}
@@ -753,6 +808,9 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
 [data-dp-chip]:hover{background:rgba(255,255,255,.08);color:#fff;}
 [data-dp-sep]{width:1px;height:14px;background:rgba(255,255,255,.12);margin:0 2px;}
 [data-dp-hint]{font-size:11px;color:#f59e0b;}
+/* 吸附：EXE 钢琴窗口贴在 DSH 顶上时，页面给自己留出那块高度（不碰窗口尺寸）。 */
+html[data-dp-snap="1"] body{padding-top:var(--dsh-piano-snap-h,190px);}
+html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
 `
 
     /* ───────────────────────── 面板 ───────────────────────── */
@@ -770,6 +828,34 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
         return false
       }
     })()
+
+    /**
+     * 吸附留白：EXE 开了吸附，就插一段 padding，让页面顶部让出钢琴的高度（默认 190）。
+     *
+     * 为什么必须有这个函数本体：上一版只在 tick() 里调了 `syncSnapLayout(...)`，
+     * 函数却没写出来 —— 每次轮询都在 .then() 里抛 ReferenceError，
+     * 被后面的 .catch(() => {}) 吃掉，界面上一点错都看不见；
+     * 更致命的是同一句链尾的 `timer = setTimeout(tick, 140)` 也不会执行，
+     * tick() 从此再也不跑 → 网页端一个 /events 都没发过 → 完全没声。
+     *
+     * 所以这里：① 引用了就必须存在；② tick() 里的调用点另外用 try/catch 包住，
+     * 以后再有类似的"小功能"出错，也只丢那一个功能，不能连累轮询。
+     *
+     * @param {boolean} on
+     * @param {number} height 像素
+     */
+    function syncSnapLayout(on, height) {
+      const root = document.documentElement
+      if (!root) return
+      if (on) {
+        const h = Math.max(0, Math.min(400, Math.round(height || 190)))
+        root.style.setProperty('--dsh-piano-snap-h', h + 'px')
+        root.setAttribute('data-dp-snap', '1')
+      } else {
+        root.removeAttribute('data-dp-snap')
+        root.style.removeProperty('--dsh-piano-snap-h')
+      }
+    }
 
     /**
      * 主窗口 ↔ 独立窗口的协调通道。
@@ -801,19 +887,26 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
     }
 
     /** 主窗口定时问宿主：钢琴窗口还开着吗？用来同步圆点颜色。 */
+    /**
+     * 立刻问一次"窗口开着吗"，并更新 UI 状态。
+     * 给"刚做过可能拉起窗口的操作"（如 MIDI 导入）用，免得等轮询。
+     */
+    async function refreshWindowState() {
+      try {
+        const r = await fetch(API + '/popup/state', { credentials: 'same-origin', cache: 'no-store' })
+        if (!r.ok) return
+        const j = await r.json()
+        if (!!j.open !== !!UI.windowOpen) UI.set({ windowOpen: !!j.open })
+      } catch {}
+    }
+
     function watchPianoWindow() {
       if (IS_POPUP) return () => {}
       let stop = false
       const tick = async () => {
         if (stop) return
-        try {
-          const r = await fetch(API + '/popup/state', { credentials: 'same-origin', cache: 'no-store' })
-          if (r.ok) {
-            const j = await r.json()
-            if (!!j.open !== !!UI.windowOpen) UI.set({ windowOpen: !!j.open })
-          }
-        } catch {}
-        if (!stop) setTimeout(tick, 1500)
+        await refreshWindowState()
+        if (!stop) setTimeout(tick, 800)
       }
       tick()
       return () => { stop = true }
@@ -861,12 +954,330 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
       return UI
     }
 
+    /**
+     * GM 的 16 个乐器分类。每类 8 个音色，程序号连续。
+     * 下拉框按这个分组，比平铺 128 行好找。
+     */
+    const GM_GROUPS = [
+      [0, '钢琴'], [8, '色彩打击乐'], [16, '风琴'], [24, '吉他'],
+      [32, '贝斯'], [40, '弦乐'], [48, '合奏'], [56, '铜管'],
+      [64, '簧管'], [72, '长笛'], [80, '合成主音'], [88, '合成铺底'],
+      [96, '合成效果'], [104, '民族乐器'], [112, '打击乐'], [120, '音效'],
+    ]
+
+    /**
+     * 乐器下拉框。
+     *
+     * 只跟宿主说话，不直接碰 EXE —— EXE 那边在轮询 /preset，
+     * 这里 POST /instrument 改了状态，EXE 下一秒就自己切过去了。
+     * 这样网页关着、只开着窗口的场景也能用（虽然那时没人点下拉）。
+     */
+    /**
+     * 乐器选择器（自绘下拉）。
+     *
+     * 为什么不用原生 <select>：
+     *   原生下拉的列表是系统画的，滚到哪我们管不了 —— 每次打开都从头开始，
+     *   128 个音色要翻半天。换成自绘之后可以：
+     *     · 记住上次滚到哪（存 localStorage），再打开直接停在原处
+     *     · 输入框搜索（打 "violin" / "弦乐" 立刻筛）
+     *     · 分类可折叠
+     */
+    function InstrumentSelect() {
+      const [list, setList] = React.useState([])
+      const [cur, setCur] = React.useState(0)
+      const [busy, setBusy] = React.useState(false)
+      const [open, setOpen] = React.useState(false)
+      const [query, setQuery] = React.useState('')
+      const wrapRef = React.useRef(null)
+      const listRef = React.useRef(null)
+      const searchRef = React.useRef(null)
+      // 当前音色的"真值"，给快捷键用（避免读到过期的 state）
+      const curRef = React.useRef(0)
+      // 刚由用户主动切到的音色。轮询看到这个值时不再覆盖（防止回弹）
+      const lastUserPickRef = React.useRef(-1)
+
+      // 滚到哪了就记下来（按 program 记，不按像素 —— 列表长度变了也能对上）
+      const saveScroll = React.useCallback(() => {
+        const el = listRef.current
+        if (!el) return
+        try { writeLS('instTop', String(el.scrollTop)) } catch {}
+      }, [])
+
+      // 乐器清单：只取一次
+      React.useEffect(() => {
+        let alive = true
+        ;(async () => {
+          try {
+            const res = await fetch(API + '/instruments', { credentials: 'same-origin', cache: 'no-store' })
+            const r = await res.json()
+            if (!alive || !r || !r.ok) return
+            setList(Array.isArray(r.list) ? r.list : [])
+            const p0 = Number(r.current?.program) || 0
+            curRef.current = p0
+            setCur(p0)
+          } catch {}
+        })()
+        return () => { alive = false }
+      }, [])
+
+      // 当前音色：每秒轮询 /preset（AI 用 piano_instrument 切了要能看到）
+      React.useEffect(() => {
+        let alive = true
+        let timer = null
+        let lastApplied = -1
+        const tick = async () => {
+          try {
+            const res = await fetch(API + '/preset', { credentials: 'same-origin', cache: 'no-store' })
+            const r = await res.json()
+            if (alive && r && r.ok && Number.isFinite(r.program) && r.program !== lastApplied) {
+              lastApplied = r.program
+              // 用户刚切过的值不要被轮询覆盖（请求还在路上时 /preset 可能还是旧值）
+              if (r.program !== lastUserPickRef.current) {
+                curRef.current = r.program
+                setCur(r.program)
+              }
+            }
+          } catch {}
+          if (alive) timer = setTimeout(tick, 1000)
+        }
+        tick()
+        return () => { alive = false; if (timer) clearTimeout(timer) }
+      }, [])
+
+      // 点外面 / Esc 关闭
+      React.useEffect(() => {
+        if (!open) return
+        const onDoc = (e) => {
+          if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false)
+        }
+        const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
+        document.addEventListener('mousedown', onDoc)
+        document.addEventListener('keydown', onKey)
+        return () => {
+          document.removeEventListener('mousedown', onDoc)
+          document.removeEventListener('keydown', onKey)
+        }
+      }, [open])
+
+      // 打开时：聚焦搜索框 + 恢复上次滚动位置
+      React.useEffect(() => {
+        if (!open) return
+        const t = setTimeout(() => {
+          if (searchRef.current) searchRef.current.focus()
+          const el = listRef.current
+          if (el) {
+            const saved = Number(readLS('instTop', '0'))
+            if (Number.isFinite(saved) && saved > 0) el.scrollTop = saved
+          }
+        }, 0)
+        return () => clearTimeout(t)
+      }, [open])
+
+      const pick = React.useCallback(async (program) => {
+        curRef.current = program
+        lastUserPickRef.current = program
+        setCur(program)
+        setOpen(false)
+        setBusy(true)
+        try {
+          await fetch(API + '/instrument?program=' + program, { method: 'POST', credentials: 'same-origin' })
+        } catch {} finally { setBusy(false) }
+      }, [])
+
+      /**
+       * Ctrl + ↑/↓ 切上一个/下一个乐器。
+       *
+       * 为什么加这个：128 个音色，翻下拉列表太费劲。
+       * 用快捷键可以直接连着试听、快速找到想要的音色。
+       *
+       * 只在"页面有焦点"时生效，且不抢占：
+       *   · 输入框/文本域里按 Ctrl+↑↓ 不拦（那是光标移动/滚动）
+       *   · 下拉打开时也拦（那时你就是在选乐器）
+       */
+      React.useEffect(() => {
+        const onKey = (ev) => {
+          if (!ev.ctrlKey || ev.altKey || ev.metaKey) return
+          if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return
+
+          // 输入框里不拦（聊天框里 Ctrl+↑ 有别的用途）
+          const t = ev.target
+          const tag = t && t.tagName ? t.tagName.toLowerCase() : ''
+          const typing = tag === 'input' || tag === 'textarea' || (t && t.isContentEditable)
+          // 例外：我们自己那个搜索框要放行（在下面拦，用来上下选）
+          const inSearch = t && t.hasAttribute && t.hasAttribute('data-dp-instsearch')
+          if (typing && !inSearch) return
+
+          ev.preventDefault()
+          ev.stopPropagation()
+
+          const step = ev.key === 'ArrowUp' ? -1 : 1
+          // 用 ref 读当前值，不在 setState 回调里发请求 ——
+          // 那样 React 严格模式会重复执行回调，等于连发两次请求。
+          const prev = curRef.current
+          const next = Math.max(0, Math.min(list.length - 1, prev + step))
+          if (next === prev) return
+
+          curRef.current = next
+          setCur(next)
+          lastUserPickRef.current = next
+          // 立刻发切换请求（不 await，键盘要跟手）
+          fetch(API + '/instrument?program=' + next, {
+            method: 'POST',
+            credentials: 'same-origin',
+          }).catch(() => {})
+        }
+        window.addEventListener('keydown', onKey, true)
+        return () => window.removeEventListener('keydown', onKey, true)
+      }, [list.length])
+
+      if (!list.length) return null
+
+      // 搜索过滤
+      const q = query.trim().toLowerCase()
+      const match = (i) => !q || list[i].name.toLowerCase().includes(q) || String(i) === q
+
+      const rows = []
+      for (let gi = 0; gi < GM_GROUPS.length; gi++) {
+        const [startI, name] = GM_GROUPS[gi]
+        const items = []
+        for (let i = startI; i < startI + 8 && i < list.length; i++) {
+          if (!match(i)) continue
+          items.push(
+            h(
+              'button',
+              {
+                key: i,
+                type: 'button',
+                'data-dp-inst-item': '',
+                'data-sel': i === cur ? '' : undefined,
+                onClick: () => pick(i),
+              },
+              h('span', { 'data-dp-inst-num': '' }, String(i)),
+              h('span', { 'data-dp-inst-name': '' }, list[i].name),
+            ),
+          )
+        }
+        if (!items.length) continue
+        rows.push(h('div', { key: 'g' + name, 'data-dp-inst-group': '' }, name))
+        rows.push(...items)
+      }
+
+      const curName = list[cur] ? list[cur].name : ''
+
+      return h(
+        'span',
+        { 'data-dp-instwrap': '', ref: wrapRef },
+        h(
+          'button',
+          {
+            'data-dp-inst': '',
+            type: 'button',
+            disabled: busy || undefined,
+            title: cur + ' · ' + curName,
+            onClick: () => setOpen((v) => !v),
+          },
+          h('span', { 'data-dp-inst-cur': '' }, cur + ' · ' + curName),
+          h('span', { 'data-dp-inst-arrow': '' }, '▾'),
+        ),
+        open
+          ? h(
+              'div',
+              { 'data-dp-instmenu': '' },
+              h('input', {
+                ref: searchRef,
+                'data-dp-instsearch': '',
+                type: 'text',
+                placeholder: '搜索乐器…',
+                value: query,
+                onChange: (e) => setQuery(e.target.value),
+              }),
+              h(
+                'div',
+                { 'data-dp-instlist': '', ref: listRef, onScroll: saveScroll },
+                rows.length ? rows : h('div', { 'data-dp-instempty': '' }, '没有匹配的乐器'),
+              ),
+            )
+          : null,
+      )
+    }
+
+    /**
+     * 选 MIDI 文件并播放。
+     *
+     * 用 <input type="file"> + fetch 把二进制 POST 到 /upload-midi。
+     * 为什么不在浏览器里解析：解析器（lib/midi.js）在宿主那边，
+     * 而且播放队列也在宿主 —— 传文件过去解析+排队，一条路走完，
+     * 不在前端维护第二份 MIDI 解析代码。
+     */
+    function MidiPicker() {
+      const [busy, setBusy] = React.useState(false)
+      const [msg, setMsg] = React.useState('')
+      const inputRef = React.useRef(null)
+
+      const onPick = React.useCallback(async (e) => {
+        const file = e.target.files && e.target.files[0]
+        e.target.value = ''      // 同一个文件能重复选
+        if (!file) return
+        setBusy(true)
+        setMsg('')
+        try {
+          const buf = await file.arrayBuffer()
+          const res = await fetch(
+            API + '/upload-midi?name=' + encodeURIComponent(file.name),
+            { method: 'POST', credentials: 'same-origin', body: buf },
+          )
+          const r = await res.json()
+          if (r && r.ok) {
+            setMsg(`${r.notes} 个音 · ${r.seconds} 秒`)
+            // 上传会顺带把钢琴窗口拉起来 —— 立刻同步一次状态，
+            // 不用等下一轮轮询，圆点马上变绿。
+            refreshWindowState()
+          } else {
+            setMsg(r?.error || '播放失败')
+            refreshWindowState()
+          }
+        } catch (err) {
+          setMsg(String(err?.message || err))
+        } finally {
+          setBusy(false)
+        }
+      }, [])
+
+      return h(
+        'span',
+        { 'data-dp-midibox': '', title: msg || '选一个 .mid 文件直接播放' },
+        h('input', {
+          ref: inputRef,
+          type: 'file',
+          accept: '.mid,.midi,audio/midi,audio/x-midi',
+          'data-dp-midifile': '',
+          onChange: onPick,
+        }),
+        h(
+          'button',
+          {
+            'data-dp-midi': '',
+            'data-busy': busy ? '' : undefined,
+            type: 'button',
+            disabled: busy || undefined,
+            title: msg || '选一个 .mid 文件直接播放',
+            onClick: () => inputRef.current && inputRef.current.click(),
+          },
+          // 文字不变，只用样式表达"忙" —— 换成"读取中"会让按钮变宽，
+          // 整排工具栏往两边抖一下（用户看到的就是"导入时按钮跳了一下"）。
+          'MIDI',
+        ),
+        // 不显示"多少音/多少秒" —— 播放时这个信息用不上，还占位置。
+        // msg 只在失败时通过 title 提示，成功就静默。
+      )
+    }
+
     /** 右上角那排工具里的「钢琴」按钮。 */
     function PianoPill() {
       const ui = usePianoUI()
       // 挂载时开始轮询宿主，同步"窗口是否开着"，圆点颜色才不会失真
       React.useEffect(() => watchPianoWindow(), [])
-      return h(
+      const pill = h(
         'button',
         {
           'data-dp-pill': '',
@@ -892,6 +1303,18 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
         },
         h('span', { 'data-dp-dot': '', 'data-on': (ui.windowOpen || ui.open || ui.playing) ? '' : undefined }),
         h('span', null, '钢琴'),
+      )
+
+      // 乐器选择框挨着胶囊。只开着独立窗口时这里不显示（那是 EXE 自己的顶栏管）。
+      // 导出不做按钮 —— 它是个"命令"而不是"操作"：
+      // 用户要导出时在对话里说一声（piano_export 工具）就够了，
+      // 工具栏上多一个按钮只会挤位置、还容易误点。
+      return h(
+        'span',
+        { 'data-dp-pillbox': '' },
+        pill,
+        h(InstrumentSelect, null),
+        h(MidiPicker, null),
       )
     }
 
@@ -1331,7 +1754,12 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
               }
               // 吸附状态：EXE 开了吸附，插件就在页面顶部让出钢琴的高度。
               // 这是"插件里留空间"，不碰 DSH 窗口尺寸，最大化/全屏都自然生效。
-              syncSnapLayout(!!data.snap, Number(data.snapH) || 190)
+              // 单独 try/catch：留白是装饰，不能让它把下面的排音和轮询带走。
+              try {
+                syncSnapLayout(!!data.snap, Number(data.snapH) || 190)
+              } catch (err) {
+                dlog('snap layout failed: ' + ((err && err.message) || err))
+              }
 
               const events = Array.isArray(data.events) ? data.events : []
               if (events.length) {
@@ -1339,7 +1767,13 @@ html[data-dp-popup] [data-dp-board]{height:100%;min-height:0;width:100%;}
                 onEvents(events, data.now, data.label || '')
               }
             })
-            .catch(() => {})
+            .catch((err) => {
+              // 以前这里是 .catch(() => {})：轮询里任何一处抛错都被吃得干干净净，
+              // 界面上完全看不出「其实是坏了」。现在至少留一条。
+              if (err && err.name !== 'AbortError') {
+                dlog('poll failed: ' + ((err && err.message) || err))
+              }
+            })
             .then(() => {
               if (!cancelled) timer = window.setTimeout(tick, 140)
             })

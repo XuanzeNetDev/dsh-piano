@@ -35,6 +35,16 @@ namespace DshPiano
         public double ShelfState; // 高频搁架的参考低通状态
         public double ShelfCoef;  // 参考低通系数（2kHz）
         public bool Dead;
+
+        // ── 以下用于 GM 多乐器。钢琴路径上全部保持默认值，
+        //    行为与改造前逐字节一致（0.008 / 1.4 / 不循环）。──
+        public int LoopStart;        // 循环起点（采样点），0 = 不循环
+        public int LoopEnd;          // 循环终点，> LoopStart 才生效
+        public double AttackSec = 0.008;    // 起音淡入时长
+        public double DecaySec = 1.4;       // 指数衰减时间常数
+        public double SustainLevel;         // 衰减到的下限（1.0 = 不掉）
+        public double ReleaseSec;           // 松键后的释放时长（0 = 不用）
+        public double HoldSec;              // 这个音该持续多久，到点开始释放
     }
 
     static class Audio
@@ -60,6 +70,156 @@ namespace DshPiano
         public static bool SoundEnabled = true;
 
         public static string RecordPath = "";
+
+        /// <summary>
+        /// 离线渲染：不经过 waveOut，直接把整首曲子的混音写成 WAV。
+        ///
+        /// 为什么要单独一条路，而不是"边播边录"：
+        ///   边播边录受实时性影响 —— 系统卡一下就会掉帧，渲染出来有断续；
+        ///   而且必须真的等那么长时间（三分钟的歌要等三分钟）。
+        ///   离线渲染是"有多少帧算多少帧"，几百倍速，而且结果确定、可复现。
+        ///
+        /// 实现上复用同一套 Voice / 混音 / 滤波代码，只是把输出去向从
+        /// waveOut 的缓冲改成文件。音色和实时播放完全一致 —— 这里没有第二套合成器。
+        /// </summary>
+        /// <param name="path">输出 WAV 路径</param>
+        /// <param name="timeline">[{ midi, at(ms), dur(ms), velocity, program, channel }]</param>
+        /// <param name="tailMs">最后一个音之后再录多久（留余振）</param>
+        /// <returns>渲染的秒数</returns>
+        public static double RenderToWav(string path, System.Collections.IList timeline, int tailMs = 2500)
+        {
+            if (timeline == null || timeline.Count == 0) return 0;
+
+            // 1) 先算出总时长
+            double totalMs = 0;
+            foreach (var raw in timeline)
+            {
+                var e = raw as System.Collections.IDictionary;
+                if (e == null) continue;
+                double at = Convert.ToDouble(e["at"], System.Globalization.CultureInfo.InvariantCulture);
+                double dur = Convert.ToDouble(e["dur"], System.Globalization.CultureInfo.InvariantCulture);
+                if (at + dur > totalMs) totalMs = at + dur;
+            }
+            totalMs += tailMs;
+            long totalFrames = (long)(totalMs / 1000.0 * SR);
+            if (totalFrames <= 0) return 0;
+            if (totalFrames > (long)SR * 3600) totalFrames = (long)SR * 3600;   // 上限 1 小时
+
+            Log("RENDER " + path + "  " + (totalMs / 1000.0).ToString("0.0") + "s  " + timeline.Count + " 音");
+
+            // 2) 时间轴按时刻排序，逐帧推进
+            // 用一个简单结构体而不是匿名类型 + dynamic：
+            // 这里的 csc 是 .NET 4.0（C# 5），没有 dynamic 的运行时绑定，
+            // 而且 ArrayList.Sort 只认 IComparer，不认 lambda。
+            var notes = new List<RenderNote>();
+            foreach (var raw in timeline)
+            {
+                var e = raw as System.Collections.IDictionary;
+                if (e == null) continue;
+                notes.Add(new RenderNote
+                {
+                    At = (long)Convert.ToDouble(e["at"], System.Globalization.CultureInfo.InvariantCulture),
+                    Dur = (int)Convert.ToDouble(e["dur"], System.Globalization.CultureInfo.InvariantCulture),
+                    Midi = Convert.ToInt32(e["midi"], System.Globalization.CultureInfo.InvariantCulture),
+                    Vel = Convert.ToDouble(e["velocity"], System.Globalization.CultureInfo.InvariantCulture),
+                });
+            }
+            notes.Sort(delegate (RenderNote a, RenderNote b) { return a.At.CompareTo(b.At); });
+
+            var output = new short[totalFrames];
+            var mix = new float[FRAMES];
+            double dcIn = 0, dcOut = 0, dcInPrev = 0, dcOutPrev = 0;
+            int nextNote = 0;
+            long frame = 0;
+
+            lock (gate)
+            {
+                voices.Clear();
+
+                while (frame < totalFrames)
+                {
+                    // 到点的音全部排进来（提前量按帧算，不用毫秒）
+                    long nowMs = (long)(frame * 1000.0 / SR);
+                    while (nextNote < notes.Count && notes[nextNote].At <= nowMs)
+                    {
+                        var n = notes[nextNote];
+                        QueueGM(n.Midi, n.Vel, n.Dur);
+                        nextNote++;
+                    }
+
+                    Array.Clear(mix, 0, FRAMES);
+                    for (int i = voices.Count - 1; i >= 0; i--)
+                    {
+                        var v = voices[i];
+                        MixVoice(v, mix, FRAMES);
+                        if (v.Dead) voices.RemoveAt(i);
+                    }
+
+                    int n2 = (int)Math.Min(FRAMES, totalFrames - frame);
+                    for (int k = 0; k < n2; k++)
+                    {
+                        dcIn = mix[k];
+                        dcOut = DcCoef * (dcOutPrev + dcIn - dcInPrev);
+                        dcInPrev = dcIn;
+                        dcOutPrev = dcOut;
+                        double x = Math.Tanh(dcOut);
+                        output[frame + k] = (short)(x * 32000);
+                    }
+                    frame += n2;
+                }
+            }
+
+            // 3) 写 WAV
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+            {
+                var h = new byte[44];
+                int dataBytes = output.Length * 2;
+                System.Text.Encoding.ASCII.GetBytes("RIFF").CopyTo(h, 0);
+                // 偏移 4 的 RIFF 块长度：**文件总长 - 8**。
+                // 漏填这个字段（一直是 0）的话，播放器/音频库会认为文件损坏 ——
+                // Python 的 wave 模块直接报 "not a WAVE file"，
+                // Windows 播放器也打不开。之前一直是 0，导出的文件其实不能用。
+                BitConverter.GetBytes(dataBytes + 36).CopyTo(h, 4);
+                System.Text.Encoding.ASCII.GetBytes("WAVEfmt ").CopyTo(h, 8);
+                BitConverter.GetBytes(16).CopyTo(h, 16);
+                BitConverter.GetBytes((short)1).CopyTo(h, 20);
+                BitConverter.GetBytes((short)1).CopyTo(h, 22);
+                BitConverter.GetBytes(SR).CopyTo(h, 24);
+                BitConverter.GetBytes(SR * 2).CopyTo(h, 28);
+                BitConverter.GetBytes((short)2).CopyTo(h, 32);
+                BitConverter.GetBytes((short)16).CopyTo(h, 34);
+                System.Text.Encoding.ASCII.GetBytes("data").CopyTo(h, 36);
+                BitConverter.GetBytes(dataBytes).CopyTo(h, 40);
+                fs.Write(h, 0, 44);
+                var bytes = new byte[output.Length * 2];
+                Buffer.BlockCopy(output, 0, bytes, 0, bytes.Length);
+                fs.Write(bytes, 0, bytes.Length);
+            }
+
+            Log("RENDER done " + (output.Length / (double)SR).ToString("0.0") + "s");
+            return output.Length / (double)SR;
+        }
+
+        /// <summary>离线渲染用的音符结构（避免 anonymous + dynamic）。</summary>
+        struct RenderNote
+        {
+            public long At;
+            public int Dur;
+            public int Midi;
+            public double Vel;
+        }
+
+        /// <summary>离线渲染时按 Midi 事件排一个音（和 GmEngine.Play 同样的选采样逻辑）。</summary>
+        static void QueueGM(int midi, double vel, int durMs)
+        {
+            if (GmEngine.Ready && GmEngine.CurrentProgram != 0)
+            {
+                GmEngine.Play(midi, vel, durMs, true);
+                return;
+            }
+            Play(midi, vel);
+        }
+
         public static void StartRecord()
         {
             if (string.IsNullOrEmpty(RecordPath)) return;
@@ -254,6 +414,9 @@ namespace DshPiano
             return ok + " 个采样";
         }
 
+        /// <summary>给 GmEngine 用的公开入口（ReadWav 本身保持 private）。</summary>
+        public static short[] ReadWavPublic(string path) { return ReadWav(path); }
+
         static short[] ReadWav(string path)
         {
             var bytes = File.ReadAllBytes(path);
@@ -398,6 +561,190 @@ namespace DshPiano
             }
         }
 
+        /// <summary>
+        /// 播一段任意采样（GM 乐器走这个入口）。
+        /// 与 Play() 的区别：这里由调用方给定起止、循环点和包络，不做钢琴专用假设。
+        ///
+        /// sf2EnvMs 用的是 SF2 的时间单位：毫秒的绝对值，-32768 表示"瞬时"。
+        /// 这里只翻译成秒，不做别的解释。
+        /// </summary>
+/// <summary>
+        /// 把一个 voice 混进 mix（累加，不清零）。
+        ///
+        /// 实时播放和离线渲染共用这一个函数 —— 这样导出的 WAV 和听到的声音
+        /// 走的是同一套包络、滤波、循环逻辑，不存在"录出来和听起来不一样"。
+        /// </summary>
+        static void MixVoice(Voice v, float[] mix, int count)
+        {
+                var d = v.Data;
+                for (int n = 0; n < count; n++)
+                {
+                    // ── 循环回绕 ──
+                    // 钢琴路径 LoopEnd=0，这一段永不进入，行为与改造前一致。
+                    // GM 的弦乐/风琴/铺底是长音，采样只有 1-3 秒，
+                    // 必须靠 sf2 自带的 loop 点续着，否则拉一个长音两秒就断。
+                    if (v.LoopEnd > v.LoopStart && v.Pos >= v.LoopEnd)
+                    {
+                        double span = v.LoopEnd - v.LoopStart;
+                        if (span > 8)
+                            v.Pos = v.LoopStart + (v.Pos - v.LoopEnd) % span;
+                        else
+                            v.LoopEnd = 0;   // 循环段太短，回绕会变成嗡嗡声，直接放弃
+                    }
+
+                    int idx = (int)v.Pos;
+                    if (idx >= v.End - 1 || idx >= d.Length - 1)
+                    {
+                        // 不循环的采样播完就结束；
+                        // 循环的如果还能走到这儿，说明 loop 点越界了，也结束。
+                        v.Dead = true;
+                        break;
+                    }
+
+                    double env;
+                    double atk = v.AttackSec > 1e-6 ? v.AttackSec : 1e-6;
+                    if (v.Elapsed < atk)
+                    {
+                        env = v.Elapsed / atk;          // 起音淡入，防"啪"
+                    }
+                    else
+                    {
+                        // ── 到点释放 ──
+                        // 循环采样自己不会结束，必须由"这个音该响多久"来收。
+                        // HoldSec 是音符时长；超过之后按 ReleaseSec 线性淡出。
+                        // 钢琴路径 HoldSec=0（不设），跳过这一段，行为不变。
+                        if (v.HoldSec > 0 && v.Elapsed >= v.HoldSec)
+                        {
+                            double rel = v.ReleaseSec > 0.01 ? v.ReleaseSec : 0.12;
+                            double over = v.Elapsed - v.HoldSec;
+                            if (over >= rel) { v.Dead = true; break; }
+                            env = 1.0 - over / rel;
+                            // 释放阶段不再走后面那套衰减计算
+                            goto envelopeDone;
+                        }
+
+                        env = Math.Exp(-(v.Elapsed - atk) / Math.Max(0.001, v.DecaySec));
+
+                        // sustain 下限：GM 乐器衰减到某个电平后应该保持住
+                        // （风琴/弦乐是持续的，不是敲一下就没了）。
+                        // 钢琴 SustainLevel=0，这一行不改变任何东西。
+                        if (v.SustainLevel > 0 && env < v.SustainLevel)
+                            env = v.SustainLevel;
+
+                        // 收尾淡出只对不循环的采样做。
+                        // 循环的长音不需要，它会一直响到松键。
+                        if (v.LoopEnd <= v.LoopStart)
+                        {
+                            double totalSec = (v.End - v.Start) / v.Rate / SR;
+                            double remain = totalSec - v.Elapsed;
+                            if (remain < 0.040)
+                            {
+                                if (remain <= 0) { v.Dead = true; break; }
+                                env *= remain / 0.040;
+                            }
+                        }
+                        if (env < 0.0006 && v.SustainLevel <= 0.001) { v.Dead = true; break; }
+                    }
+                    envelopeDone:;
+
+                    // rate==1（每键独立采样）时 frac 恒为 0，8-tap 插值纯属浪费，
+                    // 权重只有 k=0 是 1，其余全 0 —— 直接取整即可，省 8 倍。
+                    double smp;
+                    if (v.Rate == 1.0) smp = d[idx];
+                    else smp = SampleSinc(d, v.Pos, v.Start, v.End);
+                    v.LpState += v.LpCoef * (smp - v.LpState);
+                    // 两级级联高通（12dB/oct），把 40Hz 以下的能量压死
+                    double hp1 = HpCoef * (v.HpPrevOut + v.LpState - v.HpPrevIn);
+                    v.HpPrevIn = v.LpState;
+                    v.HpPrevOut = hp1;
+                    double hp = HpCoef2 * (v.Hp2PrevOut + hp1 - v.Hp2PrevIn);
+                    v.Hp2PrevIn = hp1;
+                    v.Hp2PrevOut = hp;
+                    // 高频搁架：bright = x + k(x - lowpass2k(x))。
+                    // 起音第一帧 ShelfState 还是 0，公式会变成 x + k·x（放大 2.1 倍），
+                    // 每个音的起音都"哒"一下 —— 听感就是跟着音符走的节拍器。
+                    // 前 10ms 让 ShelfState 直接跟随 hp，跳过放大。
+                    if (v.Elapsed < 0.010) v.ShelfState = hp;
+                    else v.ShelfState += v.ShelfCoef * (hp - v.ShelfState);
+                    double bright = hp + 1.1 * (hp - v.ShelfState);
+                    mix[n] += (float)(bright / 32768.0 * v.Gain * env);
+                    v.Pos += v.Rate;
+                    v.Elapsed += v.Rate / SR;
+                }
+        }
+
+        public static void PlaySample(
+            short[] data, int start, int end,
+            int loopStart, int loopEnd,
+            double rate, double gain,
+            int attackMs, int decayMs, int sustainDb, int releaseMs,
+            int rawSampleRate, double holdSec)
+        {
+            if (!SoundEnabled) return;
+            if (data == null || data.Length < 64) return;
+
+            // 采样率归一：GM 里 44100 和 48000 混着，统一到引擎的 SR
+            if (rawSampleRate > 0 && rawSampleRate != SR)
+                rate *= (double)rawSampleRate / SR;
+
+            double v = Math.Max(0.02, Math.Min(1.0, gain / 0.95));
+            double cutoff = Math.Min(9000, 7000 + 2000 * v);
+            double coef = 1.0 - Math.Exp(-2.0 * Math.PI * cutoff / SR);
+            double shelfCoef = 1.0 - Math.Exp(-2.0 * Math.PI * 2000.0 / SR);
+
+            // SF2 的包络时间单位是"时间cents"：ms = 2^(val/1200)，val=-32768 视为 0
+            double attackSec = EnvSeconds(attackMs, 0.008);
+            double decaySec = EnvSeconds(decayMs, 1.4);
+            double releaseSec = EnvSeconds(releaseMs, 0.0);
+            // sustainVolEnv 是"衰减掉多少 centibel"：
+            //   0    = 一点都不掉（小提琴/弦乐/风琴这类持续音，也包含钢琴）
+            //   1000 = 掉 100 dB（等于静音）
+            // 之前写反了 —— 把 0 当成"衰减到 0"，于是小提琴 1ms 内就没声了。
+            // 正确的换算是 10^(-centibel/200)：0 → 1.0，1000 → 1e-5。
+            double sustain = Math.Pow(10.0, -Math.Max(0, sustainDb) / 200.0);
+            if (sustain > 1.0) sustain = 1.0;
+
+            lock (gate)
+            {
+                // 复音上限：超过就偷最老的那个。
+                // GM 的长音（弦乐、风琴）不会自己结束，没有这道闸门，
+                // 一首曲子播到一半就有几十个 voice 叠在一起，直接削波。
+                while (voices.Count >= MAX_VOICES) voices.RemoveAt(0);
+
+                voices.Add(new Voice
+                {
+                    Data = data,
+                    Start = start,
+                    End = end,
+                    Loop = loopStart,
+                    Pos = start,
+                    Rate = rate,
+                    Gain = gain,
+                    LpCoef = coef,
+                    ShelfCoef = shelfCoef,
+                    LoopStart = loopStart,
+                    LoopEnd = loopEnd,
+                    AttackSec = attackSec,
+                    DecaySec = decaySec,
+                    SustainLevel = sustain,
+                    ReleaseSec = releaseSec,
+                    HoldSec = holdSec,
+                });
+            }
+            Log("GMPLAY start=" + start + " end=" + end + " loop=" + loopStart + ".." + loopEnd +
+                " rate=" + rate.ToString("0.0000") + " gain=" + gain.ToString("0.000"));
+        }
+
+        /// <summary>SF2 时间cents → 秒。负值按 0 处理。</summary>
+        static double EnvSeconds(int timecents, double fallback)
+        {
+            if (timecents <= -32768) return 0.0;
+            if (timecents == 0) return fallback;
+            double sec = Math.Pow(2.0, timecents / 1200.0);
+            if (sec > 60) sec = 60;
+            return sec;
+        }
+
         public static void AllOff()
         {
             lock (gate) voices.Clear();
@@ -405,6 +752,13 @@ namespace DshPiano
 
         /// <summary>缓冲数量。3 块折中：延迟约 70ms，同时仍有 2 块在前台排队，不容易断粮。</summary>
         const int NBUF = 3;
+
+        /// <summary>
+        /// 复音上限。超过就偷最老的 voice。
+        /// 24 对钢琴够（十个手指最多按十几个音 + 踏板余音），
+        /// GM 弦乐那种不停的长音需要多留一点，给 32。
+        /// </summary>
+        const int MAX_VOICES = 32;
 
         static void PumpLoop()
         {
@@ -461,60 +815,7 @@ namespace DshPiano
                     for (int i = voices.Count - 1; i >= 0; i--)
                     {
                         var v = voices[i];
-                        var d = v.Data;
-                        for (int n = 0; n < FRAMES; n++)
-                        {
-                            int idx = (int)v.Pos;
-                            if (idx >= v.End - 1 || idx >= d.Length - 1)
-                            {
-                                // 不做 loop 回绕：回绕点是硬跳，相位不连续，每跳一次一声"咔"。
-                                // 直接结束，让包络负责收尾（波表每段 2-3 秒，够用）。
-                                v.Dead = true;
-                                break;
-                            }
-
-                            double env;
-                            if (v.Elapsed < 0.008) env = v.Elapsed / 0.008;   // 8ms 淡入，防起音"啪"
-                            else
-                            {
-                                env = Math.Exp(-(v.Elapsed - 0.008) / 1.4);
-                                // 收尾：最后 40ms 线性收到 0。
-                                // 波表每段只有 2-3 秒，播到末尾时幅度还没归零，
-                                // 硬切就是一声"咔"（耳机里像扔垃圾）。
-                                double totalSec = (v.End - v.Start) / v.Rate / SR;
-                                double remain = totalSec - v.Elapsed;
-                                if (remain < 0.040)
-                                {
-                                    if (remain <= 0) { v.Dead = true; break; }
-                                    env *= remain / 0.040;
-                                }
-                                if (env < 0.0006) { v.Dead = true; break; }
-                            }
-
-                            // rate==1（每键独立采样）时 frac 恒为 0，8-tap 插值纯属浪费，
-                            // 权重只有 k=0 是 1，其余全 0 —— 直接取整即可，省 8 倍。
-                            double smp;
-                            if (v.Rate == 1.0) smp = d[idx];
-                            else smp = SampleSinc(d, v.Pos, v.Start, v.End);
-                            v.LpState += v.LpCoef * (smp - v.LpState);
-                            // 两级级联高通（12dB/oct），把 40Hz 以下的能量压死
-                            double hp1 = HpCoef * (v.HpPrevOut + v.LpState - v.HpPrevIn);
-                            v.HpPrevIn = v.LpState;
-                            v.HpPrevOut = hp1;
-                            double hp = HpCoef2 * (v.Hp2PrevOut + hp1 - v.Hp2PrevIn);
-                            v.Hp2PrevIn = hp1;
-                            v.Hp2PrevOut = hp;
-                            // 高频搁架：bright = x + k(x - lowpass2k(x))。
-                            // 起音第一帧 ShelfState 还是 0，公式会变成 x + k·x（放大 2.1 倍），
-                            // 每个音的起音都"哒"一下 —— 听感就是跟着音符走的节拍器。
-                            // 前 10ms 让 ShelfState 直接跟随 hp，跳过放大。
-                            if (v.Elapsed < 0.010) v.ShelfState = hp;
-                            else v.ShelfState += v.ShelfCoef * (hp - v.ShelfState);
-                            double bright = hp + 1.1 * (hp - v.ShelfState);
-                            mix[n] += (float)(bright / 32768.0 * v.Gain * env);
-                            v.Pos += v.Rate;
-                            v.Elapsed += v.Rate / SR;
-                        }
+                        MixVoice(v, mix, FRAMES);
                         if (v.Dead) voices.RemoveAt(i);
                     }
                 }
