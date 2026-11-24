@@ -37,3 +37,7 @@ Thumbs.db
 # ── 本地配置 ──
 .env
 .env.*
+
+# 历史实现留档（piano-window.ps1 等），不进包
+# 注意：保留在仓库里供参考，但 package.json 的 files 不含它
+tools/archive/

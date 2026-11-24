@@ -1,8 +1,14 @@
 import { pathToFileURL } from 'node:url'
 import { readFileSync, existsSync, unlinkSync } from 'node:fs'
+import { dirname, resolve, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+// 没有参数时从本文件位置推包根（`npm run test:host` 不传参）
 const dir = process.argv[2]
-const { apply } = await import(pathToFileURL(dir + '/index.js').href)
+  ? resolve(process.argv[2])
+  : resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+const { apply } = await import(pathToFileURL(join(dir, 'index.js')).href)
 
 const tools = []
 const routes = []
@@ -25,7 +31,7 @@ const T = (n) => tools.find((t) => t.name === n)
 
 console.log('=== 工具注册 ===')
 check(['piano_score', 'piano_play', 'piano_piece', 'piano_stop', 'piano_status'].every((n) => !!T(n)),
-  '5 个工具都注册了：' + tools.map((t) => t.name).join(', '))
+  '工具都注册了：' + tools.map((t) => t.name).join(', '))
 
 console.log('=== piano_score：写谱 + 演奏 ===')
 const tmp = dir + '/scores/__smoke.score'
@@ -63,13 +69,25 @@ const route = routes[0]
 check(route && route.path === '/api/dsh-piano-xz', '路由前缀', route && route.path)
 const captured = []
 const mk = () => ({ statusCode: 0, headers: {}, setHeader() {}, end(b) { captured.push(b) } })
-await route.handler({ method: 'GET', url: '/api/dsh-piano-xz/events?since=0' }, mk())
+// /events 按 User-Agent 前 40 字符分桶记游标 —— 假请求必须带 UA，
+// 否则 handler 里读 req.headers['user-agent'] 会抛异常，返回 {ok:false,error:...}
+const req = {
+  method: 'GET',
+  url: '/api/dsh-piano-xz/events?since=0',
+  headers: { 'user-agent': 'dsh-piano-selftest/1.0' },
+}
+await route.handler(req, mk())
 const ev = JSON.parse(captured[0])
-check(ev.ok && ev.events.length > 0, '事件队列有货', 'events=' + ev.events.length)
+check(ev.ok && Array.isArray(ev.events) && ev.events.length > 0,
+      '事件队列有货', ev.ok ? 'events=' + (ev.events || []).length : ev.error)
+if (!ev.ok) { console.log('       响应: ' + String(captured[0]).slice(0, 160)) }
+const ev0 = (ev.events || [])[0]
+check(ev0 && typeof ev0.m === 'number' && typeof ev0.t === 'number', '事件带 midi 和时刻')
 check(typeof ev.events[0].m === 'number' && typeof ev.events[0].t === 'number', '事件带 midi 和时刻')
 await route.handler({ method: 'GET', url: '/api/dsh-piano-xz/info' }, mk())
 const info = JSON.parse(captured[1])
-check(info.version === '2.0.0' || info.ok, '/info 正常', 'version=' + info.version)
+const pkgVersion = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version
+check(info.ok && info.version === pkgVersion, '/info 正常', 'version=' + info.version)
 
 for (const f of [tmp, tmp + '.2']) if (existsSync(f)) unlinkSync(f)
 

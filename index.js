@@ -34,7 +34,6 @@ import { describeMidi, midiToTimeline, parseMidi } from './lib/midi.js'
 
 export const name = 'dsh-piano-xz'
 
-const VERSION = '2.1.0'
 const ROUTE = '/api/dsh-piano-xz'
 
 /** 一次最多排多少音，防超长谱把队列撑爆。 */
@@ -46,7 +45,22 @@ const MAX_MIDI_BYTES = 16_000_000
 
 /** 钢琴采样目录（Salamander Grand Piano V3，CC BY 3.0，每 3 个半音一个）。 */
 const PKG_ROOT = dirname(fileURLToPath(import.meta.url))
-const SAMPLE_DIR = join(PKG_ROOT, 'assets', 'piano')
+
+/**
+ * 版本号从 package.json 读，不硬编码。
+ *
+ * 之前写死 '2.1.0'，package.json 升到 2.2.0 之后忘了同步，
+ * /info 就一直在报旧版本 —— 用户查"装的是哪版"会看到错的。
+ * 现在只有 package.json 一个源头，不会再漂。
+ */
+const VERSION = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(join(PKG_ROOT, 'package.json'), 'utf8'))
+    return typeof pkg.version === 'string' ? pkg.version : '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+})()
 /** 采样文件读一次就留在内存里，本地 300KB 一个，30 个也就 5MB。 */
 const sampleCache = new Map()
 
@@ -562,7 +576,7 @@ function resolveExportPath(rawFile, rawDir) {
 
   const looksAbsolute = /^[a-zA-Z]:[\\/]/.test(name) || name.startsWith('\\\\') || name.startsWith('/')
   if (!looksAbsolute) name = name.replace(/[\\/:*?"<>|]/g, '_')
-  if (!/\\.(wav|mp3)$/i.test(name)) name += '.wav'
+  if (!/\.(wav|mp3)$/i.test(name)) name += '.wav'
 
   let dir = String(rawDir || '').trim()
   if (!dir) dir = defaultExportDir()
@@ -1144,25 +1158,9 @@ async function handle(req, res, engine, playText, origin) {
       origin: origin || '',
       popup: origin ? origin + ROUTE + '/popup' : '',
       range: { low: noteName(MIDI_MIN), high: noteName(MIDI_MAX), keys: KEY_COUNT, middleC: noteName(MIDDLE_C) },
-      samples: {
-        dir: SAMPLE_DIR,
-        count: existsSync(SAMPLE_DIR)
-          ? readdirSync(SAMPLE_DIR).filter((f) => f.endsWith('.mp3')).length
-          : 0,
-        layers: ['v1', 'v5', 'v16'],
-        release: true,
-      },
       melodies: melodyCatalog(),
       status: engine.status(),
     })
-  }
-
-  if (method === 'GET' && path === '/popup') {
-    // 独立钢琴窗口用的最小页面。不加载 DSH 本体：
-    // ① dsh-app:// 协议在 window.open 出来的窗口里不可靠；
-    // ② 再启动一个 DSH 实例会跟主窗口抢 Session。
-    // 这里只要键盘 + 采样 + 轮询，够用且互不干扰。
-    return sendHtml(res, renderPopupPage())
   }
 
   if (method === 'POST' && path === '/popup/open') {
@@ -1190,28 +1188,15 @@ async function handle(req, res, engine, playText, origin) {
         return sendJson(res, 200, { ok: false, error: String(error?.message ?? error) })
       }
     }
-    const script = join(PKG_ROOT, 'tools', 'popup-open.ps1')
-    if (!existsSync(script)) {
-      return sendJson(res, 200, { ok: false, error: '既没有 PianoWindow.exe 也没有 popup-open.ps1' })
-    }
-    const profile = join(PKG_ROOT, 'record', '_chrome-popup-profile')
-    try {
-      const out = spawnSync(
-        'powershell',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
-          '-Url', api + '/popup', '-Height', '300', '-ProfileDir', profile],
-        { encoding: 'utf8', timeout: 15000, windowsHide: true },
-      )
-      const text = String(out.stdout || '').trim()
-      const line = text.split(/\r?\n/).filter(Boolean).pop() || ''
-      try {
-        return sendJson(res, 200, Object.assign({ engine: 'chrome' }, JSON.parse(line)))
-      } catch {
-        return sendJson(res, 200, { ok: false, error: '启动脚本没有返回结果', raw: text.slice(0, 300) })
-      }
-    } catch (error) {
-      return sendJson(res, 200, { ok: false, error: String(error?.message ?? error) })
-    }
+    // 原来的 Chrome --app 备用方案已经删了。
+    //
+    // 它会在浏览器里生成一整块 88 键键盘 + Web Audio 发声 —— 那等于把
+    // 「网页版钢琴」又做一遍，和现在「EXE 是唯一发声者」的架构冲突。
+    // 而且它的前提是「没有 PianoWindow.exe」，现在 EXE 已入库，这个前提不成立了。
+    return sendJson(res, 200, {
+      ok: false,
+      error: '找不到 tools/PianoWindow.exe。请在仓库根目录跑一次 install.ps1。',
+    })
   }
 
   // 钢琴窗口是否开着（client 用它决定胶囊按钮是"打开"还是"关闭"）
@@ -1334,14 +1319,19 @@ async function handle(req, res, engine, playText, origin) {
 
   // EXE 渲染完回报
   if (method === 'POST' && path === '/render/done') {
+    // readBody 已经 JSON.parse 过了，返回的是对象。
+    // 原来这里又 parse 一次，字符串化后必然抛异常 ——
+    // 表现就是"回调收到 200，但 done 永远置不上，前端等 60 秒超时"。
     const body = await readBody(req)
-    let data = {}
-    try { data = JSON.parse(body || '{}') } catch {}
+    const data = (body && typeof body === 'object') ? body : {}
+    winLog('render/done 收到 id=' + data.id
+           + ' 当前 renderJob=' + (renderJob ? renderJob.id : 'null')
+           + ' 匹配=' + !!(renderJob && data.id === renderJob.id))
     if (renderJob && data.id === renderJob.id) {
       renderJob.done = true
       renderJob.ok = !!data.ok
       renderJob.seconds = Number(data.seconds) || 0
-      renderJob.out = renderJob.out
+      winLog('render/done 已标记 done=' + renderJob.id)
     }
     return sendJson(res, 200, { ok: true })
   }
@@ -1424,29 +1414,6 @@ async function handle(req, res, engine, playText, origin) {
     return sendJson(res, 200, { ok: true, ...snapshot })
   }
 
-  // 采样音频：浏览器那边 fetch 一次 decodeAudioData 就常驻
-  if (method === 'GET' && path.startsWith('/sample/')) {
-    const name = decodeURIComponent(path.slice('/sample/'.length))
-    // 采样文件名是纯数字：MIDI 号 + 力度层，例如 63v5.mp3。
-    // 之前用音名（D#4v5.mp3），# 在 URL 里会被当锚点截断，带升号的采样全部 404 —— 
-    // 右手一半的音因此静音。改名之后 URL 里不再有需要转义的字符。
-    if (!/^(?:\d+v\d+|rel\d+)\.mp3$/.test(name)) {
-      return sendJson(res, 400, { ok: false, error: '采样名不合法' })
-    }
-    let body = sampleCache.get(name)
-    if (!body) {
-      const file = join(SAMPLE_DIR, name)
-      if (!existsSync(file)) return sendJson(res, 404, { ok: false, error: '没有这个采样' })
-      body = readFileSync(file)
-      sampleCache.set(name, body)
-    }
-    res.statusCode = 200
-    res.setHeader('content-type', 'audio/mpeg')
-    res.setHeader('cache-control', 'public, max-age=31536000, immutable')
-    res.setHeader('content-length', String(body.length))
-    res.end(body)
-    return
-  }
 
   if (method === 'POST' && path === '/play') {
     const body = await readBody(req)
@@ -1505,189 +1472,8 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload))
 }
 
-/**
- * 独立钢琴窗口的页面。
- *
- * 特意写成自包含的一页：不 import、不依赖 DSH 的模块加载器。
- * 它只做四件事 —— 画 88 键、加载采样、轮询 /events、按时间点响。
- * window.open 出来的窗口里跑不了 dsh-app:// 那一套，所以这些得自带。
- */
-function renderPopupPage() {
-  const api = ROUTE
-  const p = [
-    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>DSH 钢琴</title><style>',
-    'html,body{margin:0;height:100%;background:#0b1017;overflow:hidden;',
-    'font:12px/1.4 system-ui,"Segoe UI",sans-serif;color:#c9d1dc;user-select:none;}',
-    '#bar{display:flex;align-items:center;gap:10px;height:34px;padding:0 12px;',
-    'background:#0d1219;border-bottom:1px solid rgba(255,255,255,.07);}',
-    '#name{color:#7dd3a0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:38vw;}',
-    '#gap{flex:1;}',
-    '#bar input[type=range]{width:76px;accent-color:#22c55e;}',
-    'button{height:22px;padding:0 9px;border-radius:6px;cursor:pointer;font:inherit;font-size:11.5px;',
-    'color:#c9d1dc;border:1px solid rgba(255,255,255,.13);background:transparent;}',
-    'button:hover{background:rgba(255,255,255,.08);color:#fff;}',
-    '#hint{color:#f59e0b;font-size:11px;}',
-    '#stage{position:relative;height:calc(100% - 34px);padding:10px 12px 8px;box-sizing:border-box;}',
-    '#board{position:relative;height:100%;}',
-    '.wk{position:absolute;top:0;bottom:0;box-sizing:border-box;',
-    'background:linear-gradient(180deg,#fff 0%,#f9fbfe 52%,#e9eef6 86%,#dbe2ee 100%);',
-    'border:1px solid #b6c0d0;border-top:0;border-radius:0 0 6px 6px;',
-    'box-shadow:inset 0 2px 0 rgba(255,255,255,.9),0 3px 0 #a9b3c4,0 5px 9px rgba(0,0,0,.35);',
-    'display:flex;align-items:flex-end;justify-content:center;padding-bottom:4px;',
-    'font-size:8px;color:#8c96a8;}',
-    '.bk{position:absolute;top:0;height:62%;box-sizing:border-box;z-index:2;',
-    'background:linear-gradient(180deg,#4b5568 0%,#2b3345 42%,#141924 82%,#05080d 100%);',
-    'border:1px solid #05080d;border-top:0;border-radius:0 0 4px 4px;',
-    'box-shadow:inset 0 2px 0 rgba(255,255,255,.2),0 4px 0 #04070b,0 7px 11px rgba(0,0,0,.55);}',
-    '.wk.hit-lh{animation:hl .55s ease-out both;}',
-    '.wk.hit-rh{animation:hr .55s ease-out both;}',
-    '.bk.hit-lh{animation:hlb .55s ease-out both;}',
-    '.bk.hit-rh{animation:hrb .55s ease-out both;}',
-    '@keyframes hl{0%{background:#1d4ed8}60%{background:#60a5fa}100%{background:#dbe2ee}}',
-    '@keyframes hr{0%{background:#15803d}60%{background:#4ade80}100%{background:#dbe2ee}}',
-    '@keyframes hlb{0%{background:#1e40af}60%{background:#3b82f6}100%{background:#05080d}}',
-    '@keyframes hrb{0%{background:#14532d}60%{background:#22c55e}100%{background:#05080d}}',
-    '</style></head><body>',
-    '<div id="bar"><span id="name">钢琴</span><span id="hint" hidden>点一下开始</span>',
-    '<span id="gap"></span><span>音量</span>',
-    '<input id="vol" type="range" min="0" max="100" value="100">',
-    '<button id="stop">停</button><button id="close">×</button></div>',
-    '<div id="stage"><div id="board"></div></div>',
-    '<script>(function(){',
-    'var API=', JSON.stringify(api), ';',
-    'var MIN=21,MAX=108,WHITE=[0,2,4,5,7,9,11];',
-    'var NAMES=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];',
-    // 黑键相对"左侧白键右缘"的偏移，按真钢琴比例微调
-    'var OFF={1:-0.10,3:0.10,6:-0.12,8:0,10:0.12};',
-    'var ac=null,bus=null,vol=1,seq=0,stopTick=0,primed=false;',
-    'var S={},LOADING={},board=document.getElementById("board");',
-    'var keys={};',
 
-    // ── 建键盘 ──
-    'var whites=[],midi;',
-    'for(midi=MIN;midi<=MAX;midi++){if(WHITE.indexOf(midi%12)>=0)whites.push(midi);}',
-    'var w=100/whites.length,wi=0,bw=w*0.62;',
-    'var frag=document.createDocumentFragment();',
-    'for(midi=MIN;midi<=MAX;midi++){',
-    ' var pc=((midi%12)+12)%12,el=document.createElement("div");',
-    ' if(WHITE.indexOf(pc)>=0){',
-    '  el.className="wk";el.style.left=(wi*w)+"%";el.style.width=w+"%";',
-    '  if(pc===0)el.textContent="C"+(Math.floor(midi/12)-1);',
-    '  keys[midi]=el;frag.appendChild(el);wi++;',
-    ' }else{',
-    '  var left=(wi*w)+(OFF[pc]||0)*w-bw/2;',
-    '  el.className="bk";el.style.left=Math.max(0,left)+"%";el.style.width=bw+"%";',
-    '  keys[midi]=el;frag.appendChild(el);',
-    ' }',
-    '}',
-    'board.appendChild(frag);',
 
-    // ── 音频 ──
-    'function ensure(){',
-    ' if(ac)return ac;',
-    ' var C=window.AudioContext||window.webkitAudioContext;if(!C)return null;',
-    ' ac=new C();bus=ac.createGain();bus.gain.value=vol;bus.connect(ac.destination);',
-    ' preload();return ac;',
-    '}',
-    'function snap(m){return Math.max(21,Math.min(108,Math.round((m-21)/3)*3+21));}',
-    'function layer(v){return v<0.38?1:(v<0.72?5:16);}',
-    'function preload(){',
-    ' var list=[];for(var m=21;m<=108;m+=3){list.push(m+"v1.mp3",m+"v5.mp3",m+"v16.mp3");}',
-    ' list.forEach(function(f){',
-    '  if(S[f]||LOADING[f])return;LOADING[f]=1;',
-    '  fetch(API+"/sample/"+f).then(function(r){return r.ok?r.arrayBuffer():null;})',
-    '   .then(function(b){if(!b)return null;return ac.decodeAudioData(b);})',
-    '   .then(function(buf){if(buf)S[f]=buf;}).catch(function(){});',
-    ' });',
-    '}',
-    'function pick(m,v){',
-    ' var s=snap(m),lv=layer(v),f=s+"v"+lv+".mp3";',
-    ' return S[f]||S[s+"v5.mp3"]||S[s+"v1.mp3"]||S[s+"v16.mp3"]||null;',
-    '}',
-    'function strike(m,when,dur,v){',
-    ' var buf=pick(m,v);if(!buf)return;',
-    ' var s=ac.createBufferSource();s.buffer=buf;',
-    ' s.playbackRate.value=Math.pow(2,(m-snap(m))/12);',
-    ' var g=ac.createGain(),peak=(0.15+0.85*Math.pow(v,0.8))*0.55;',
-    ' g.gain.setValueAtTime(0,when);',
-    ' g.gain.linearRampToValueAtTime(peak,when+0.004);',
-    ' g.gain.setTargetAtTime(0,when+Math.max(dur,0.6),0.35);',
-    ' s.connect(g);g.connect(bus);s.start(when);',
-    ' try{s.stop(when+Math.max(dur,0.6)+2.2);}catch(e){}',
-    '}',
-
-    // ── 点灯 ──
-    'function paint(m){',
-    ' var el=keys[m];if(!el)return;',
-    ' var cls=m<60?"hit-lh":"hit-rh";',
-    ' el.classList.remove("hit-lh","hit-rh");void el.offsetWidth;',
-    ' el.classList.add(cls);',
-    ' setTimeout(function(){el.classList.remove(cls);},560);',
-    '}',
-
-    // ── 轮询 ──
-    'function schedule(events,now){',
-    ' for(var i=0;i<events.length;i++){',
-    '  var e=events[i],due=(e.t-now)/1000;',
-    '  if(due>6)continue;',
-    '  if(due<-3)continue;',
-    '  var d=Math.max(0.1,(e.d||400)/1000);',
-    '  strike(e.m,ac.currentTime+Math.max(0.01,due),d,e.v==null?0.78:e.v);',
-    '  (function(m,ms){setTimeout(function(){paint(m);},Math.max(0,due*1000));})(e.m,due);',
-    ' }',
-    '}',
-    'function tick(){',
-    ' fetch(API+"/events?since="+seq).then(function(r){return r.json();}).then(function(d){',
-    '  if(!d||!d.ok)return;',
-    '  if(!primed){primed=true;stopTick=d.stop||0;}',
-    '  else if((d.stop||0)!==stopTick){',
-    '   stopTick=d.stop||0;',
-    '   if(bus){bus.gain.cancelScheduledValues(ac.currentTime);bus.gain.setValueAtTime(0,ac.currentTime);',
-    '    bus.gain.setValueAtTime(vol,ac.currentTime+0.05);}',
-    '   for(var k in keys){keys[k].classList.remove("hit-lh","hit-rh");}',
-    '   document.getElementById("name").textContent="钢琴";',
-    '   return;',
-    '  }',
-    '  var ev=d.events||[];',
-    '  if(ev.length){',
-    '   for(var i=0;i<ev.length;i++){if(ev[i].i>seq)seq=ev[i].i;}',
-    '   if(!ac)ensure();',
-    '   if(ac&&ac.state!=="running"){ac.resume().catch(function(){});}',
-    '   if(ac&&ac.state==="running")schedule(ev,d.now);',
-    '  }',
-    ' }).catch(function(){}).then(function(){setTimeout(tick,140);});',
-    '}',
-
-    // ── 控件 ──
-    'var volEl=document.getElementById("vol");',
-    'volEl.oninput=function(){vol=Number(volEl.value)/100;if(bus)bus.gain.value=vol;};',
-    'document.getElementById("stop").onclick=function(){',
-    ' fetch(API+"/stop",{method:"POST"}).catch(function(){});',
-    '};',
-    'document.getElementById("close").onclick=function(){window.close();};',
-    'var kick=function(){var a=ensure();if(a&&a.state!=="running")a.resume().catch(function(){});',
-    ' document.getElementById("hint").hidden=true;};',
-    'window.addEventListener("pointerdown",kick,true);',
-    'window.addEventListener("keydown",kick,true);',
-    // 通知主窗口让位：两边同时轮询 /events 会各排一遍音，听起来是重奏。
-    'try{var bc=new BroadcastChannel("dsh-piano-xz");',
-    'bc.postMessage({type:"popup-open"});',
-    'window.addEventListener("beforeunload",function(){',
-    'try{bc.postMessage({type:"popup-close"});}catch(e){}});}catch(e){}',
-    'ensure();tick();',
-    '})();</script></body></html>',
-  ]
-  return p.join('')
-}
-
-function sendHtml(res, html) {
-  res.statusCode = 200
-  res.setHeader('content-type', 'text/html; charset=utf-8')
-  res.setHeader('cache-control', 'no-store')
-  res.end(html)
-}
 
 /**
  * 读请求体。

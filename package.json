@@ -17,7 +17,6 @@
     "client.js",
     "lib",
     "assets/yup",
-    "assets/piano",
     "assets/gm/*.sf3",
     "scores",
     "tools/sf2_parse.py",
@@ -43,7 +42,28 @@
       ]
     }
   },
-  "os": ["win32", "darwin", "linux"],
-  "keywords": ["dsh", "dsh-plugin", "钢琴", "piano", "音乐", "midi", "general-midi", "乐器", "instruments", "soundfont"],
-  "license": "SEE LICENSE IN LICENSE"
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "钢琴",
+    "piano",
+    "音乐",
+    "midi",
+    "general-midi",
+    "乐器",
+    "instruments",
+    "soundfont"
+  ],
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "test": "node tools/selfcheck.mjs",
+    "test:notation": "node tools/notation-test.mjs",
+    "test:host": "node tools/host-test.mjs",
+    "verify:gm": "node tools/verify_gm.mjs"
+  }
 }

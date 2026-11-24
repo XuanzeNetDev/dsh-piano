@@ -76,561 +76,30 @@ window.__ModuleLoader__.load({
     // 原因：HMR 换掉模块时，模块级变量全部重建 —— 采样缓存（16MB）会被清空，
     // 于是下一次弹奏退回合成兜底，听起来就是"音色又变回去了"。
     // 挂在 window 上，热更新之后 AudioContext 和已解码的采样都还在。
-    const AUDIO = window.__dshPianoAudio || (window.__dshPianoAudio = {
-      ac: null, master: null, bus: null, volume: 1, failed: false, live: new Set(),
-    })
-
-    const A4_HZ = 440
-    const freqOf = (midi) => A4_HZ * Math.pow(2, (midi - 69) / 12)
-    const clamp01 = (n) => (n < 0 ? 0 : n > 1 ? 1 : n)
-
-    function ensureAudio() {
-      if (AUDIO.ac) {
-        if (AUDIO.ac.state === 'suspended') {
-          const p = AUDIO.ac.resume()
-          if (p && p.catch) p.catch(() => {})
-        }
-        return AUDIO.ac
-      }
-      if (AUDIO.failed) return null
-      const Ctor = window.AudioContext || window.webkitAudioContext
-      if (!Ctor) {
-        AUDIO.failed = true
-        return null
-      }
-      let ac
-      try {
-        ac = new Ctor()
-      } catch {
-        AUDIO.failed = true
-        return null
-      }
-
-      const master = ac.createGain()
-      master.gain.value = AUDIO.volume
-      // 压缩器现在兼着"限制器"的活：音源电平提到 -5 dBFS 之后，
-      // 五六个音同时按下去峰值会到 +8 dB，必须收住，否则一片劈啪。
-      // 阈值 -6 dB、比例 12 基本是硬限幅，但 attack 3ms 保住了钢琴的击弦瞬态
-      // （attack 太短会把起音削掉，听感发闷）。
-      const comp = ac.createDynamicsCompressor()
-      comp.threshold.value = -6
-      comp.knee.value = 4
-      comp.ratio.value = 12
-      comp.attack.value = 0.003
-      comp.release.value = 0.15
-      master.connect(comp)
-      comp.connect(ac.destination)
-
-      const bus = ac.createGain()
-      bus.gain.value = 1
-      bus.connect(master)
-
-      AUDIO.ac = ac
-      AUDIO.master = master
-      AUDIO.bus = bus
-      // 采样在后台补齐，不阻塞第一次发声
-      if (!preloadStarted) {
-        preloadStarted = true
-        window.setTimeout(() => {
-          preloadSamples(ac).catch(() => {})
-        }, 0)
-      }
-      return ac
+    /** 调试日志：只在 window.__dpDebug 为真时输出（原来用于音频排查，留着给轮询用）。 */
+    const dlog = (line) => {
+      if (!window.__dpDebug) return
+      try { console.log('[dsh-piano] ' + line) } catch { /* 忽略 */ }
     }
 
-    /* ── 采样：Salamander Grand Piano V3（CC BY 3.0） ──────────────
+    /* ───────── 浏览器侧不再发声（已废弃）─────────
      *
-     * 30 个录音采样覆盖 MIDI 21–108，每 3 个半音一个。
-     * 中间的音用 playbackRate 变调，最大偏差 1.5 个半音 —— 这是所有
-     * 网页钢琴的标准做法，比"合成得像"高一个档次：那是真的弹三角琴录的。
-     */
-
-    const SAMPLES = window.__dshPianoSamples || (window.__dshPianoSamples = new Map())
-    const SAMPLE_LOADING = window.__dshPianoLoading || (window.__dshPianoLoading = new Set())
-    const RELEASES = window.__dshPianoReleases || (window.__dshPianoReleases = new Map())
-    const RELEASE_LOADING = window.__dshPianoRelLoading || (window.__dshPianoRelLoading = new Set())
-    let preloadStarted = false
-
-    /* ── IndexedDB：把下载过的 mp3 存起来 ────────────────────────
+     * 这里原来是约 550 行的 Web Audio 引擎：
+     *   ensureAudio / IndexedDB 采样缓存 / loadSample / preloadSamples
+     *   playSampleVoice / strike / synthVoice（物理建模）/ cutAll
+     *   SAMPLE_POINTS / SAMPLE_PEAK_DB / loudnessTrim（响度补偿表）
      *
-     * 目标只有一个：声音永远不变。
-     * 第一次装好之后，采样就在本地，刷新、热更新、重开应用都不用重新下载；
-     * 解码虽然还要跑一遍，但那是本地 CPU 的事，两三秒就好。
-     */
-
-    const DB_NAME = 'dsh-piano-xz'
-    const DB_STORE = 'mp3'
-    let dbPromise = null
-
-    function openDb() {
-      if (dbPromise) return dbPromise
-      dbPromise = new Promise((resolve) => {
-        try {
-          if (!window.indexedDB) return resolve(null)
-          const req = window.indexedDB.open(DB_NAME, 1)
-          req.onupgradeneeded = () => {
-            try {
-              req.result.createObjectStore(DB_STORE)
-            } catch {
-              /* 已经建过 */
-            }
-          }
-          req.onsuccess = () => resolve(req.result)
-          req.onerror = () => resolve(null)
-        } catch {
-          resolve(null)
-        }
-      })
-      return dbPromise
-    }
-
-    async function cacheGet(key) {
-      const db = await openDb()
-      if (!db) return null
-      return new Promise((resolve) => {
-        try {
-          const req = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(key)
-          req.onsuccess = () => resolve(req.result || null)
-          req.onerror = () => resolve(null)
-        } catch {
-          resolve(null)
-        }
-      })
-    }
-
-    async function cachePut(key, buffer) {
-      const db = await openDb()
-      if (!db) return
-      try {
-        db.transaction(DB_STORE, 'readwrite').objectStore(DB_STORE).put(buffer, key)
-      } catch {
-        /* 存不进去就算了，下次再下 */
-      }
-    }
-
-    const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    const SAMPLE_POINTS = (() => {
-      const out = []
-      for (let m = 21; m <= 108; m += 3) out.push(m)
-      return out
-    })()
-
-    /** 这个音落在哪个采样点上。 */
-    function snapToSample(midi) {
-      return Math.max(21, Math.min(108, Math.round(midi / 3) * 3))
-    }
-
-    /**
-     * 30 个采样点的实测**峰值**电平（ffmpeg volumedetect max_volume，velocity 5 层）。
+     * 为什么删：
+     *   1. EXE（PianoWindow.exe）是唯一的发声者 —— 它有 Yamaha 88 键每键采样
+     *      和 GM 128 音色，音质和延迟都比这里好。
+     *   2. 两边同时发声就是重奏：同一个音从系统和浏览器各出一次。
+     *   3. 这套引擎依赖 assets/piano/ 下 178 个 mp3（16 MB），
+     *      只为这条废弃路径服务。
      *
-     * 为什么用峰值不用平均：低音弦衰减慢、尾巴长，mean_volume 被尾巴拉低，
-     * 会把低音误判成"本来就很响"，补偿时压过头 —— 上一版就是这样把左手压没了。
-     * 钢琴音听的是起音那一瞬，所以按 max 对齐。
+     * 现在网页侧只做两件事：点灯（看琴键按下）+ 工具栏（开关/选乐器/导入 MIDI）。
+     * 声音一律由 EXE 出。
      */
-    const SAMPLE_PEAK_DB = {
-      21: -11.0, 24: -9.2, 27: -9.8, 30: -9.0, 33: -10.6,
-      36: -9.8, 39: -10.0, 42: -11.2, 45: -11.8, 48: -11.7,
-      51: -10.2, 54: -13.3, 57: -15.1, 60: -10.5, 63: -11.6,
-      66: -14.8, 69: -12.7, 72: -12.6, 75: -14.5, 78: -13.9,
-      81: -17.0, 84: -17.2, 87: -13.4, 90: -16.2, 93: -16.9,
-      96: -19.5, 99: -23.0, 102: -17.1, 105: -22.4, 108: -20.3,
-    }
-    /** 中音区（C4 一带）的峰值电平，作为统一响度的参照。 */
-    const LOUDNESS_REF_DB = -12.4
 
-    /** 把某个键的采样拉到统一响度需要的线性增益。 */
-    function loudnessTrim(midi) {
-      const peak = SAMPLE_PEAK_DB[snapToSample(midi)]
-      if (!Number.isFinite(peak)) return 1
-      return Math.pow(10, (LOUDNESS_REF_DB - peak) / 20)
-    }
-
-    /**
-     * 力度分层。Everyone Piano 那种音源是多层的，单层怎么调都平板：
-     * 轻音和重音用的是同一段录音，只是音量不同，泛音结构不变。
-     * 这里按力度分三档，每档是各自独立录的。
-     */
-    function layerFor(vel) {
-      if (vel < 0.38) return 'v1'
-      if (vel < 0.72) return 'v5'
-      return 'v16'
-    }
-
-    /** 采样文件名：纯数字，例如 midi 63 + v5 → 63v5。URL 里没有任何需要转义的字符。 */
-    function sampleName(midi, layer) {
-      return String(snapToSample(midi)) + layer
-    }
-
-    /**
-     * 加载一个采样（按「采样点 + 力度层」去重）。
-     * @returns {Promise<AudioBuffer|null>}
-     */
-    async function loadSample(ac, midi, layer) {
-      const m = snapToSample(midi)
-      const key = m + ':' + layer
-      if (SAMPLES.has(key)) return SAMPLES.get(key)
-      if (SAMPLE_LOADING.has(key)) return null
-      SAMPLE_LOADING.add(key)
-      try {
-        const file = sampleName(m, layer) + '.mp3'
-        let raw = await cacheGet(file)
-        if (!raw) {
-          // 文件名里有 #（D#4v5.mp3），不编码的话 URL 会把 # 之后当锚点丢掉，
-          // 请求变成 /sample/D 直接 404 —— 带 # 的采样点有一半。
-          const res = await fetch(API + '/sample/' + encodeURIComponent(file), { credentials: 'same-origin' })
-          if (!res.ok) throw new Error('HTTP ' + res.status)
-          raw = await res.arrayBuffer()
-          // 存一份副本：decodeAudioData 会把传进去的 ArrayBuffer 掏空
-          cachePut(file, raw.slice(0))
-        }
-        const audio = await ac.decodeAudioData(raw)
-        SAMPLES.set(key, audio)
-        return audio
-      } catch (err) {
-        window.__dpSampleErr = String((err && err.message) || err)
-        return null
-      } finally {
-        SAMPLE_LOADING.delete(key)
-      }
-    }
-
-    /**
-     * 释放采样：松键时制音器落在弦上那一下（88 个键各一个，很短的噗声）。
-     * 少了它，音是"淡出"的；有了它，音是"被止住"的 —— 这一下 EOP 有，我之前没有。
-     */
-    async function loadRelease(ac, midi) {
-      const idx = Math.max(1, Math.min(88, midi - 20))
-      if (RELEASES.has(idx)) return RELEASES.get(idx)
-      if (RELEASE_LOADING.has(idx)) return null
-      RELEASE_LOADING.add(idx)
-      try {
-        const file = 'rel' + idx + '.mp3'
-        let raw = await cacheGet(file)
-        if (!raw) {
-          const res = await fetch(API + '/sample/' + file, { credentials: 'same-origin' })
-          if (!res.ok) throw new Error('HTTP ' + res.status)
-          raw = await res.arrayBuffer()
-          cachePut(file, raw.slice(0))
-        }
-        const audio = await ac.decodeAudioData(raw)
-        RELEASES.set(idx, audio)
-        return audio
-      } catch {
-        return null
-      } finally {
-        RELEASE_LOADING.delete(idx)
-      }
-    }
-
-    /**
-     * 后台加载：先中间力度层 + 全部释放音（这几个最常用），再补轻重两端。
-     */
-    async function preloadSamples(ac) {
-      // 只加载 v5 层 + 88 个释放音。v1/v16 的三层电平基准和 v5 差太多，不混用。
-      for (const m of SAMPLE_POINTS) {
-        if (!SAMPLES.has(m + ':v5')) await loadSample(ac, m, 'v5')
-      }
-      window.__dpSamplesReady = true
-    }
-
-    /**
-     * 用采样发声：变调 + 力度控增益和亮度 + 松键淡出。
-     */
-    function playSampleVoice(ac, buf, sampleMidi, midi, when, dur, vel) {
-      const t0 = Math.max(when || 0, ac.currentTime + 0.001)
-      const hold = Math.max(0.1, Number(dur) || 0.5)
-
-      // 这里是之前最致命的一个错：把谱上的时值当成了"声音该多长"。
-      // 八分音符 = 0.288 秒，采样在 288ms 就被掐断，只剩击弦那一下，
-      // 没有余振 —— 听着就是木头、发尖、不像钢琴。
-      // 钢琴的时值是"键按住多久"，踏板踩着，短音也有完整的余振。
-      const sustain = Math.max(hold, 1.25)
-
-      const src = ac.createBufferSource()
-      src.buffer = buf
-
-      // ── 参考 mdaPiano（EOP 的音源）的几个细节 ──────────────────
-      // 1) 拉伸调音：真实钢琴高音偏高、低音偏低，不是严格十二平均律
-      // 2) 随机失谐：同一首曲子里每个音有极微小的音分差，避免"电子琴的整齐"
-      // 3) 立体声：低音偏左、高音偏右，两声部在空间上分开才不会糊成一坨
-      const fromRoot = midi - 60
-      const stretchCents = 0.000434 * (0.667 - 0.5) * fromRoot * fromRoot * 100
-      const randomCents = 0.077 * 0.283 * 0.283 * (((fromRoot * fromRoot) % 13) - 6.5) * 100
-      const cents = (midi - sampleMidi) * 100 + stretchCents + randomCents
-      src.playbackRate.value = Math.pow(2, cents / 1200)
-
-      const pan = Math.max(-1, Math.min(1, (midi - 60) / 42))
-      const panner = ac.createStereoPanner ? ac.createStereoPanner() : null
-      if (panner) panner.pan.value = pan * 0.45
-
-      // 力度只做温和的明暗变化，不拿它当音色开关。
-      // 之前是 2000 + 13000×力度：右手 0.88 → 13.4kHz、左手 0.50 → 8.5kHz，
-      // 两只手听起来像两种乐器，这就是"一块对一块不对"的来源。
-      const lp = ac.createBiquadFilter()
-      lp.type = 'lowpass'
-      lp.frequency.value = Math.min(18000, 12500 + 3500 * vel)
-
-      const g = ac.createGain()
-      // 力度曲线要平缓：之前用 vel^1.2，0.35 力度只剩 0.276 倍，
-      // 再叠上响度补偿就掉到 1/6，整只手直接听不见了。
-      // 现在是 0.15 + 0.85·vel^0.8 —— 轻手仍然清楚，只是退到后面。
-      const velGain = 0.15 + 0.85 * Math.pow(vel, 0.8)
-      // 再乘这个键的响度补偿（高低音采样电平差 12dB）。
-      //
-      // 基准为什么是 2.0 而不是 0.32：
-      //   loudnessTrim() 已经把采样峰值统一拉到 -12.4 dBFS（线性约 0.24），
-      //   旧代码再乘 0.32，出来只剩 0.24×0.844×0.32 ≈ 0.065 ≈ -23.7 dBFS。
-      //   正常钢琴应用单音在 -6 ~ -3 dBFS，这一下就低了 18 dB —— 音量滑块拉到顶也不响。
-      //   乘 2.0 让 C4 一带的单音落在 -5 dBFS 附近，多音叠加交给下面的压缩器收。
-      const peak = 2.0 * velGain * loudnessTrim(midi)
-      // 采样自己录好了完整的自然衰减（C4 通常 5～8 秒）。
-      // 之前我在 1.25 秒就把它压到 28% —— 等于人为砍掉余振，这才是"干、木、难听"的主因。
-      // 现在前 1.8 秒完全不干预，之后才按"松踏板"的速度收掉。
-      // 延音踏板开着（EOP 面板上两边都是 ON）：不提前淡出，让采样自然衰减完
-      const releaseAt = t0 + Math.max(hold + 2.6, 3.2)
-      g.gain.setValueAtTime(0, t0)
-      g.gain.linearRampToValueAtTime(peak, t0 + 0.003)
-      g.gain.setValueAtTime(peak, releaseAt)
-      g.gain.setTargetAtTime(0, releaseAt, 0.28)
-
-      src.connect(g)
-      if (panner) {
-        g.connect(lp)
-        lp.connect(panner)
-        panner.connect(AUDIO.bus)
-      } else {
-        g.connect(lp)
-        lp.connect(AUDIO.bus)
-      }
-      src.start(t0)
-      try {
-        src.stop(releaseAt + 1.6)
-      } catch {
-        /* 已经停过 */
-      }
-
-      // 释放采样（制音器落在弦上那一下）先不放了。
-      // 原意是补真实感，但密度太高：361 个音就是 361 次"噗"，叠起来是一片
-      // 翻箱倒柜的杂音，手动点单键时尤其明显。钢琴自己的自然衰减已经够了。
-      // 真要加回来，需要按"是否真的松键"和"是否踩踏板"来触发，不是每个音都来一下。
-
-      const voice = {
-        midi,
-        released: false,
-        release(now) {
-          if (voice.released) return
-          voice.released = true
-          const t = Math.max(now || ac.currentTime, ac.currentTime)
-          try {
-            g.gain.cancelScheduledValues(t)
-            g.gain.setValueAtTime(g.gain.value, t)
-            g.gain.setTargetAtTime(0, t, 0.035)
-          } catch {
-            /* 节点可能已回收 */
-          }
-          try {
-            src.stop(t + 0.4)
-          } catch {
-            /* 已经停过 */
-          }
-          window.setTimeout(() => AUDIO.live.delete(voice), 600)
-        },
-      }
-      AUDIO.live.add(voice)
-      return voice
-    }
-
-    /**
-     * 敲一个音：有采样就用采样，没加载完就退回合成。
-     */
-    function strike(midi, when, dur, vel) {
-      const ac = ensureAudio()
-      if (!ac) return null
-      const v = clamp01(Number(vel) || 0.75)
-      const m = snapToSample(midi)
-      // 只用 v5（中等力度）这一层。
-      // v1/v5/v16 三层的实测电平是 -24.2 / -13.9 / -1.5 dB —— 三套完全不同的基准，
-      // 按力度在层间跳会让同一首曲子里左右手落在不同音量体系上，
-      // 这就是"右手被压低 / 力度反了"反复出现的原因。
-      // 单层 + 平方律力度：音色统一、电平可控。
-      const buf = SAMPLES.get(m + ':v5')
-      if (!buf) {
-        loadSample(ac, midi, 'v5').catch(() => {})
-        dlog(`strike MISS midi=${midi} snap=${m} vel=${v.toFixed(2)} have=${SAMPLES.size} ac=${ac.state}`)
-        return null
-      }
-      const voice = playSampleVoice(ac, buf, m, midi, when, dur, v)
-      dlog(`strike HIT midi=${midi} snap=${m} vel=${v.toFixed(2)} dur=${Number(dur).toFixed(2)} ac=${ac.state} gain=${voice ? 'ok' : 'null'}`)
-      return voice
-    }
-
-    /**
-     * 把诊断写回宿主。
-     * 浏览器里的 console 我们看不到 —— 加日志不等于本人能读到，
-     * 所以统一走 /log，落到 record/piano.log。
-     */
-    let dlogBusy = false
-    function dlog(line) {
-      try {
-        const text = new Date().toISOString().slice(11, 23) + ' ' + line
-        if (dlogBusy) return
-        dlogBusy = true
-        fetch(API + '/log', {
-          method: 'POST',
-          credentials: 'same-origin',
-          body: text,
-        }).catch(() => {}).finally(() => { dlogBusy = false })
-      } catch {
-        /* 日志不影响演奏 */
-      }
-    }
-
-    /**
-     * 合成兜底：加法合成。
-     *
-     * 钢琴音的物理结构：一根弦被击打后，各次泛音同时起振，
-     * 但**高次泛音衰减快得多**，所以听起来是"先亮后暖"。
-     * 只用一条包络盖住所有泛音，就是电子琴；每个泛音各衰减各的，才像钢琴。
-     *
-     * @param {number} midi
-     * @param {number} when AudioContext 时刻（秒）
-     * @param {number} dur 按住多久（秒）
-     * @param {number} vel 力度 0–1
-     */
-    function synthVoice(midi, when, dur, vel) {
-      const ac = ensureAudio()
-      if (!ac) return null
-      const v = clamp01(Number(vel) || 0.75)
-      const t0 = Math.max(when || 0, ac.currentTime + 0.001)
-      const hold = Math.max(0.12, Number(dur) || 0.5)
-      const f0 = freqOf(midi)
-
-      const out = ac.createGain()
-      out.gain.value = 1
-
-      // 力度越大高频越多 —— 这是钢琴"怎么弹"的核心，不是音量大小
-      const lp = ac.createBiquadFilter()
-      lp.type = 'lowpass'
-      lp.Q.value = 0.3
-      const cut0 = Math.min(16000, Math.max(1400, f0 * (5 + 11 * v) + 800))
-      lp.frequency.setValueAtTime(cut0, t0)
-      // 高次泛音先衰减，所以截止频率也跟着往下走
-      lp.frequency.exponentialRampToValueAtTime(Math.max(600, f0 * 2.2), t0 + 0.9)
-      out.connect(lp)
-      lp.connect(AUDIO.bus)
-
-      // 弦的非谐性：真实琴弦的高次泛音比整数倍略高一点
-      const INHARMONIC = 0.00035
-      const PARTIALS = 16
-      const oscs = []
-
-      // 频率相关的整体衰减：低音余振长、高音消失快。
-      // 这一条是合成钢琴和合成风琴的分水岭 —— 少了它，低音会一直嗡嗡响。
-      const baseTau = 4.6 * Math.pow(220 / Math.max(40, f0), 0.55)
-      // 16 次泛音按 1/n^1.6 加起来约 1.85，先归一化，再按音区略减
-      const headroom = 0.30 / (1 + Math.log2(1 + f0 / 260) * 0.28)
-
-      for (let n = 1; n <= PARTIALS; n++) {
-        const f = f0 * n * Math.sqrt(1 + INHARMONIC * n * n)
-        if (f > 17000) break
-        // 幅度：1/n^1.6（比 1/n 陡得多，听着才不"电子"）；重弹时高次泛音相对更强
-        const amp = Math.pow(n, -1.6) * Math.pow(v, 0.35 + 0.55 / n) * headroom
-        if (amp < 0.0006) continue
-        // 每个泛音自己衰减，高次快得多
-        const tau = Math.max(0.05, baseTau / (1 + Math.pow(n, 1.1) * 0.55))
-
-        const o = ac.createOscillator()
-        o.type = 'sine'
-        o.frequency.setValueAtTime(f, t0)
-
-        const g = ac.createGain()
-        // 两段衰减：先是击弦瞬间的快速跌落（40ms 掉到三成），然后才是弦的余振
-        g.gain.setValueAtTime(0, t0)
-        g.gain.linearRampToValueAtTime(amp, t0 + 0.003)
-        g.gain.setTargetAtTime(amp * 0.34, t0 + 0.003, 0.045)
-        g.gain.setTargetAtTime(0, t0 + 0.055, tau / 3)
-
-        o.connect(g)
-        g.connect(out)
-        o.start(t0)
-        oscs.push(o)
-      }
-
-      // 松键：整体迅速收掉，模拟制音器落下去
-      out.gain.setValueAtTime(1, t0)
-      out.gain.setValueAtTime(1, t0 + hold)
-      out.gain.setTargetAtTime(0, t0 + hold, 0.055)
-
-      const stopAt = t0 + hold + 0.5
-      for (const o of oscs) {
-        try {
-          o.stop(stopAt)
-        } catch {
-          /* 已经停过 */
-        }
-      }
-
-      const voice = {
-        midi,
-        released: false,
-        release(now) {
-          if (voice.released) return
-          voice.released = true
-          const t = Math.max(now || ac.currentTime, ac.currentTime)
-          try {
-            out.gain.cancelScheduledValues(t)
-            out.gain.setValueAtTime(out.gain.value, t)
-            out.gain.setTargetAtTime(0, t, 0.045)
-          } catch {
-            /* 节点可能已回收 */
-          }
-          for (const o of oscs) {
-            try {
-              o.stop(t + 0.35)
-            } catch {
-              /* 已经停过 */
-            }
-          }
-          window.setTimeout(() => AUDIO.live.delete(voice), 600)
-        },
-      }
-      AUDIO.live.add(voice)
-      return voice
-    }
-
-    function cutAll() {
-      const ac = AUDIO.ac
-      const now = ac ? ac.currentTime : 0
-      for (const voice of Array.from(AUDIO.live)) {
-        try {
-          voice.release(now)
-        } catch {
-          /* 忽略 */
-        }
-      }
-      AUDIO.live.clear()
-      // 保险：总线瞬间静音再恢复。
-      // 一首曲子的事件在开演时就全部排进 AudioContext 时间轴了（未来十几秒的音都已经
-      // 调度好），光 release 单个 voice 可能漏掉几个；这里直接把总线掐一下，50ms 后恢复。
-      //
-      // 这里原来有个会永久静音的错：
-      //   setValueAtTime(0, now) 之后再来一句 setValueAtTime(1, now + 0.05) ——
-      //   两个都是「插入一个事件」，后者并不会覆盖 0 时刻那个；
-      //   而 strike() 里的 linearRampToValueAtTime(peak, …) 从 0 爬上去之后同样不回位。
-      //   于是总线一路保持在 0：点一次「停」之后，整页直到刷新都不再出声。
-      // 正确做法：先 cancelScheduledValues 清掉排定的自动化，再用 ramp 把增益拉回 1.0。
-      if (ac && AUDIO.bus) {
-        try {
-          const g = AUDIO.bus.gain
-          const target = Number.isFinite(AUDIO.volume) ? AUDIO.volume : 1
-          g.cancelScheduledValues(now)
-          g.setValueAtTime(0, now)
-          g.linearRampToValueAtTime(target, now + 0.06)
-        } catch {
-          /* 忽略 */
-        }
-      }
-    }
 
     /* ───────────────────────── 样式 ───────────────────────── */
 
@@ -1285,7 +754,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
           type: 'button',
           title: ui.open ? '收起 DSH 钢琴' : '打开 DSH 钢琴',
           onClick: async () => {
-            ensureAudio()
             if (!IS_POPUP) {
               // 开着就关，关着就开 —— 同一个按钮，点一下切一次。
               if (UI.windowOpen) {
@@ -1334,7 +802,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
       const [info, setInfo] = React.useState(null)
       const [octave, setOctave] = React.useState(4)
       const [playing, setPlaying] = React.useState(false)
-      const [ready, setReady] = React.useState(0)
       const [hint, setHint] = React.useState(false)
       const [nowPlaying, setNowPlaying] = React.useState('')
 
@@ -1350,7 +817,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
           const type = e && e.data && e.data.type
           if (type === 'popup-open') {
             pausedRef.current = true
-            cutAll()
             clearLights()
             pendingEvents.current = []
             setPlaying(false)
@@ -1400,9 +866,9 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
       const live = React.useRef({})
       live.current = { open, autoOpen }
 
+      // 音量滑块只记用户偏好，不再驱动任何音频 —— 声音是 EXE 发的，
+      // 它的输出音量由系统混音器控制。这个值留着，将来若给 EXE 传音量可以用上。
       React.useEffect(() => {
-        AUDIO.volume = volume
-        if (AUDIO.master) AUDIO.master.gain.value = volume
         writeLS('vol2', Math.round(volume * 100))
       }, [volume])
 
@@ -1430,22 +896,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
         return () => {
           cancelled = true
         }
-      }, [])
-
-      // 面板一挂上就开始加载采样（AudioContext 挂在 suspended 状态也能解码），
-      // 不等用户先点一下；顺便每 500ms 把已就绪数量同步到界面。
-      React.useEffect(() => {
-        const ac = ensureAudio()
-        if (ac && SAMPLES.size < 90 && !window.__dshPianoPreloading) {
-          window.__dshPianoPreloading = true
-          preloadSamples(ac)
-            .catch(() => {})
-            .finally(() => {
-              window.__dshPianoPreloading = false
-            })
-        }
-        const id = window.setInterval(() => setReady(SAMPLES.size), 500)
-        return () => window.clearInterval(id)
       }, [])
 
       /**
@@ -1500,10 +950,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
             'paint ' + (window.__dpOk || 0) + '/' + (window.__dpMiss || 0)
             + ' · 近 0.9s 击键 ' + recent
             + ' · 键 ' + keys
-            + ' · 采样 ' + SAMPLES.size + '/90'
-            + ' · 释放 ' + RELEASES.size + '/88'
-            + (window.__dpStrikeErr ? ' · 音频错:' + window.__dpStrikeErr : '')
-            + (window.__dpSampleErr ? ' · 采样错:' + window.__dpSampleErr : '')
         }, 300)
         return () => window.clearInterval(id)
       }, [])
@@ -1554,21 +1000,15 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
        */
       const SCHED_WINDOW_SEC = 6
 
-      /** 把一条事件变成声音 + 灯。 */
+      /**
+       * 把一条事件变成「灯」。
+       *
+       * 原来这里还会调 strike() 让浏览器发声 —— 已经去掉了：
+       * EXE 是唯一发声者，网页这边只负责把琴键点亮，
+       * 否则同一个音会从系统和浏览器各响一次。
+       */
       const fireEvent = React.useCallback(
         (e, dueSec) => {
-          const ac = AUDIO.ac
-          const when = (ac ? ac.currentTime : 0) + Math.max(0.004, dueSec)
-          const durSec = Math.max(0.1, (e.d || 400) / 1000)
-          dlog(`fire midi=${e.m} due=${dueSec.toFixed(3)} dur=${durSec.toFixed(2)} ac=${ac ? ac.state : 'null'}`)
-          if (ac) {
-            try {
-              strike(e.m, when, durSec, e.v == null ? 0.78 : e.v)
-            } catch (err) {
-              // 音频出错绝不能连累点灯：记一笔，继续往下走
-              window.__dpStrikeErr = String((err && err.message) || err)
-            }
-          }
           hold(e.m, Math.max(0, dueSec * 1000))
         },
         [hold],
@@ -1625,84 +1065,20 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
       )
 
       /**
-       * AudioContext 被浏览器挂起时，先把整批事件存这儿。
+       * 事件入口：直接进调度窗口。
        *
-       * 为什么不能直接排：suspended 状态下 ac.currentTime 是不走的。
-       * 按「当前时刻 + 延时」算出来的 when 会全部挤在同一个瞬间，
-       * 一旦 resume，几百个音同时炸开，比没声音还糟。
+       * 原来要先过一遍 AudioContext 状态检查（挂起就把事件攒着等用户手势唤醒）——
+       * 那是给「浏览器发声」准备的。现在只点灯，没有 AudioContext 也就没有挂起，
+       * 直接排就是。
        */
-      const waiting = React.useRef([])
-      const lastLabel = React.useRef('')
-
-      /** 唤醒成功后，把挂起期间攒下的音补上。 */
-      const flushWaiting = React.useCallback(() => {
-        const ac = AUDIO.ac
-        if (!ac || ac.state !== 'running' || !waiting.current.length) return
-        const c = clock.current
-        const nowServer = c.serverNow ? c.serverNow + (Date.now() - c.at) : 0
-        if (!nowServer) return
-        // 已经过去太久的音就别补了，补了也是错拍
-        const batch = waiting.current.filter((e) => e.t + (e.d || 400) > nowServer)
-        waiting.current = []
-        setHint(false)
-        if (batch.length) scheduleBatch(batch, nowServer, lastLabel.current)
-      }, [scheduleBatch])
-
       const onEvents = React.useCallback(
         (events, serverNow, label) => {
           if (!events.length) return
-          const ac = ensureAudio()
-          if (label) lastLabel.current = label
-
-          if (!ac || ac.state !== 'running') {
-            // 没 running：存起来，并且顺手试一次 resume。
-            // 真正成功要靠一次用户手势 —— 那个监听装在下面的 effect 里。
-            waiting.current = waiting.current.concat(events)
-            clock.current = { serverNow, at: Date.now() }
-            setHint(true)
-            if (ac) {
-              const p = ac.resume()
-              if (p && p.then) p.then(() => flushWaiting()).catch(() => {})
-            }
-            return
-          }
+          if (label) setNowPlaying(label)
           scheduleBatch(events, serverNow, label)
         },
-        [scheduleBatch, flushWaiting],
+        [scheduleBatch],
       )
-
-      /**
-       * 全局手势唤醒。
-       *
-       * 浏览器只认「用户手势」这一个开关。旧代码只在点钢琴面板时 resume，
-       * 所以插件一重载、AudioContext 一被挂起，就得重新去点那一小块 ——
-       * 用起来像每次都坏了。这里挂到 window 上：页面上点任何地方、按任何键，
-       * 都能把它叫醒，并且把挂起期间攒的音补回去。
-       */
-      React.useEffect(() => {
-        const kick = () => {
-          const ac = AUDIO.ac
-          if (!ac) return
-          if (ac.state === 'running') {
-            if (waiting.current.length) flushWaiting()
-            return
-          }
-          const p = ac.resume()
-          if (p && p.then) {
-            p.then(() => {
-              if (AUDIO.ac && AUDIO.ac.state === 'running') flushWaiting()
-            }).catch(() => {})
-          }
-        }
-        window.addEventListener('pointerdown', kick, true)
-        window.addEventListener('keydown', kick, true)
-        window.addEventListener('touchstart', kick, true)
-        return () => {
-          window.removeEventListener('pointerdown', kick, true)
-          window.removeEventListener('keydown', kick, true)
-          window.removeEventListener('touchstart', kick, true)
-        }
-      }, [flushWaiting])
 
       // 滑窗推进器
       React.useEffect(() => {
@@ -1743,7 +1119,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
                 stopRef.current = data.stop || 0
                 // 三件一起清：正在响的、排队等着点灯的、还没进调度窗口的。
                 // 少清任何一样，琴都会在「停」之后接着动。
-                cutAll()
                 clearLights()
                 pendingEvents.current = []
                 clock.current = { serverNow: 0, at: 0 }
@@ -1817,18 +1192,14 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
         box.scrollLeft = Math.max(0, middle.offsetLeft - first.offsetLeft - box.clientWidth * 0.26)
       }, [open])
 
+      /**
+       * 鼠标点键：只点灯，不发声。
+       *
+       * 想听声音就用独立窗口上的键盘（Z X C V B N M），
+       * 那边是 EXE 在发声，音色和采样都是真的。
+       */
       const press = React.useCallback(
         (midi) => {
-          const ac = ensureAudio()
-          if (!ac) {
-            setHint(true)
-            return
-          }
-          if (ac.state !== 'running') setHint(true)
-          const old = held.current.get(midi)
-          if (old) old.release()
-          const voice = strike(midi, ac.currentTime + 0.004, 2.2, 0.78)
-          if (voice) held.current.set(midi, voice)
           hold(midi, 0)
         },
         [hold],
@@ -1878,8 +1249,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
       }, [open, octave, press, release])
 
       const playMelody = (id, title) => {
-        const ac = ensureAudio()
-        if (ac && ac.state === 'suspended') ac.resume().catch(() => {})
         setNowPlaying(title)
         fetch(API + '/play', {
           method: 'POST',
@@ -1890,24 +1259,12 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
       }
 
       const stopAll = () => {
-        cutAll()
         clearLights()
         pendingEvents.current = []
         clock.current = { serverNow: 0, at: 0 }
         setPlaying(false)
         setNowPlaying('')
         fetch(API + '/stop', { method: 'POST', credentials: 'same-origin' }).catch(() => {})
-      }
-
-      const cardClick = () => {
-        if (!hint) return
-        const ac = ensureAudio()
-        if (ac) {
-          const p = ac.resume()
-          if (p && p.catch) p.catch(() => {})
-          if (ac.state === 'running') setHint(false)
-          else window.setTimeout(() => setHint(ac.state !== 'running'), 240)
-        }
       }
 
       const style = h('style', { key: 'dp-css' }, CSS)
@@ -1927,16 +1284,16 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
           { 'data-dp-root': '' },
           h(
             'div',
-            { 'data-dp-card': '', onClick: cardClick },
+            { 'data-dp-card': '', onClick: () => setHint(false) },
             h(
               'div',
               { 'data-dp-head': '' },
               h('span', { 'data-dp-title': '' }, '♪'),
               h('span', { 'data-dp-sub': '' }, playing
                 ? (nowPlaying || '正在演奏')
-                : (ready < 90 ? '加载 ' + ready + '/90' : '钢琴')),
+                : '钢琴'),
               h('span', { 'data-dp-grow': '' }),
-              hint ? h('span', { 'data-dp-hint': '' }, '点一下开声音') : null,
+              hint ? h('span', { 'data-dp-hint': '' }, '声音由独立窗口发出') : null,
               h(
                 'label',
                 { 'data-dp-vol': '' },
@@ -2052,34 +1409,6 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
           el.textContent = CSS
           document.head.appendChild(el)
         }
-        // 热更新会重建模块：AudioContext 还在、采样可能只加载了一半。
-        // 这里补一刀，缺多少补多少，不用用户去刷新页面。
-        if (!window.__dshPianoPreloading && AUDIO.ac && SAMPLES.size < 90) {
-          window.__dshPianoPreloading = true
-          preloadSamples(AUDIO.ac)
-            .catch(() => {})
-            .finally(() => {
-              window.__dshPianoPreloading = false
-            })
-        }
-
-        ctx.effect(() => {
-          const wake = () => {
-            const ac = ensureAudio()
-            if (ac && ac.state === 'suspended') {
-              const p = ac.resume()
-              if (p && p.catch) p.catch(() => {})
-            }
-          }
-          document.addEventListener('pointerdown', wake, { capture: true, passive: true })
-          document.addEventListener('keydown', wake, { capture: true })
-          return () => {
-            document.removeEventListener('pointerdown', wake, { capture: true })
-            document.removeEventListener('keydown', wake, { capture: true })
-            cutAll()
-          }
-        }, 'dsh-piano-xz: 音频唤醒')
-
         const slots = (typeof ctx.get === 'function' ? ctx.get('slots') : undefined) || ctx.slots
         if (!slots) return
 

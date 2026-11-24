@@ -1,10 +1,35 @@
 import { createRequire } from 'node:module'
 import { readFileSync, existsSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+/**
+ * 包根目录。
+ *
+ * 原来靠 process.argv[2] 传进来（手动跑时 `node tools/selfcheck.mjs .`），
+ * 但 `npm test` 不会传参数，dir 就是 undefined，
+ * 于是所有 readFileSync 都报 "path must be of type string" —— 测试从来跑不起来。
+ *
+ * 改成从本文件位置往上推，两条路都能跑。
+ */
 const dir = process.argv[2]
-const req = createRequire('C:/Users/海冥乐/.dsh/profiles/desktop/package.json')
-const yaml = req('js-yaml')
+  ? resolve(process.argv[2])
+  : resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+// js-yaml 不一定装得到（本项目零依赖），拿不到就跳过 YAML 检查
+let yaml = null
+try {
+  const req = createRequire(join(dir, 'package.json'))
+  yaml = req('js-yaml')
+} catch {
+  // 从 DSH profile 里借一份（宿主自己有）
+  try {
+    const req = createRequire(join(process.env.USERPROFILE || '', '.dsh', 'profiles', 'desktop', 'package.json'))
+    yaml = req('js-yaml')
+  } catch {
+    yaml = null
+  }
+}
 
 let failures = 0
 function ok(msg) { console.log('  OK    ' + msg) }

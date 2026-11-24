@@ -1,9 +1,15 @@
 import { pathToFileURL } from 'node:url'
 import { readFileSync } from 'node:fs'
+import { dirname, resolve, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+// 同 selfcheck：没有参数时从本文件位置推包根
 const dir = process.argv[2]
-const { parseScore, toTimeline } = await import(pathToFileURL(dir + '/lib/score.js').href)
-const { noteName } = await import(pathToFileURL(dir + '/lib/notes.js').href)
+  ? resolve(process.argv[2])
+  : resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+const { parseScore, toTimeline } = await import(pathToFileURL(join(dir, 'lib', 'score.js')).href)
+const { noteName } = await import(pathToFileURL(join(dir, 'lib', 'notes.js')).href)
 
 let bad = 0
 const check = (cond, msg, extra) => {

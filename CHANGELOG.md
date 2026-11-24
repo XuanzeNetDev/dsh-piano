@@ -4,6 +4,83 @@
 
 ---
 
+## 2026-11-24（下午）— 废弃网页发声、全站瘦身
+
+版本保持 `2.2.0`。这一轮只有一个目标：**确认 EXE 是唯一发声者，把网页那套全删掉。**
+
+### 背景
+
+`client.js` 里有一套完整的 Web Audio 引擎（约 550 行）：IndexedDB 采样缓存、
+物理建模合成、响度补偿表、调度窗口。它和 EXE 各发一遍声，听感是**重奏**。
+
+EXE 有 Yamaha 88 键每键采样和 GM 128 音色，音质和延迟都更好；
+那套引擎只为废弃路径服务，还带着 178 个 mp3（16 MB）。
+
+### 删掉的
+
+| 内容 | 规模 |
+|---|---|
+| `client.js` Web Audio 引擎 | 约 550 行（`ensureAudio` / `loadSample` / `strike` / `synthVoice` / `cutAll` / IndexedDB 缓存） |
+| `client.js` 调度链的音频部分 | `scheduleBatch` 保留，`fireEvent` 去掉 `strike` |
+| `client.js` AudioContext 唤醒逻辑 | 手势唤醒 effect、`cardClick`、`flushWaiting` |
+| `index.js` 的 `/popup` 页面 | `renderPopupPage` 214 行（内嵌一整块网页钢琴 + Web Audio） |
+| `index.js` 的 `/sample` 路由 | 服务 178 个 mp3 |
+| `index.js` 的 Chrome 备用方案 | `popup-open.ps1` 整块（内嵌网页钢琴） |
+| `assets/piano/` | 178 个 Salamander mp3，**16 MB** |
+| `tools/popup-open.ps1` | 8.6 KB |
+| `tools/piano-window.ps1` | 8.6 KB（最早的 PowerShell 版窗口，移到 `tools/archive/`） |
+| `docs/screenshot.png` | 212.8 KB（和 `interface.png` md5 完全相同，无人引用） |
+
+**代码规模**：`client.js` 2110 → 1439 行（-671），`index.js` 1774 → 1545 行（-229）。
+
+### 保留的
+
+网页端只剩工具栏：`PianoPill`（开关）、`InstrumentSelect`（选乐器）、
+`MidiPicker`（导入 MIDI），以及琴键点亮（`hold()`，纯视觉，不发声）。
+
+**EXE 相关文件一个字节都没动**（`PianoWindow.exe` / `.cs` / `PianoAudio.cs` / `GmEngine.cs`
+哈希与改动前完全一致）。
+
+### 顺手修的两个 bug
+
+**① 导出的文件名 `.wav.wav`**
+
+`resolveExportPath` 里的正则写成了 `/\\.(wav|mp3)$/i` —— 多一个反斜杠，
+匹配永远失败，于是每次都追加 `.wav`。
+
+**② 导出等 60 秒超时，但文件其实已经生成**
+
+`/render/done` 里写的是 `JSON.parse(await readBody(req))`，
+但 `readBody` **已经 parse 过了**，返回的是对象。再 `JSON.parse` 一个对象必然抛异常，
+被 `handler` 的 catch 吞掉 → 回调返回 200，但 `renderJob.done` 永远置不上 →
+前端轮询到 60 秒放弃。
+
+日志证据：
+
+```
+23:05:26.899 RENDER start id=rmwuttq8t notes=108
+23:05:27.060 RENDER done 42.5s
+23:05:27.068 RENDER callback ok {"ok":true,"seconds":42.51}
+       ↑ 渲染和回调都成功了，但前端不知道
+```
+
+### 验证
+
+```
+Export Test      导出 潮汐之外.wav → C:\Users\海冥乐\Downloads
+                 3.6 MB  44100Hz 1ch 16bit  42.5s  峰值 0.832
+                 RIFF 长度字段 3749064 = 文件大小 - 8  ✓
+                 文件名没有 .wav.wav  ✓
+EXE 播放          重启后 88 采样 / GM 128 乐器 / waveOut 正常
+selfcheck        自检全部通过
+notation-test    全部通过
+host-test        全部通过（8 个工具 + HTTP 路由）
+verify_gm        128 乐器 / 6361 采样 / 零缺文件
+```
+
+---
+
+
 ## 2026-11-24 — 多乐器、导出、界面
 
 版本 `2.1.0 → 2.2.0`。这一天基本是把插件从「一台钢琴」变成「一台能换乐器的演奏器」，
