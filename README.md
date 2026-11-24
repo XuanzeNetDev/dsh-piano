@@ -1,4 +1,4 @@
-# 璇泽科技 · DSH 钢琴（dsh-piano）
+﻿# 璇泽科技 · DSH 钢琴（dsh-piano）
 
 一台标准 **88 键**电脑钢琴，挂载在 DeepSeek Harness 上。
 
@@ -507,6 +507,10 @@ Num8=C7  Num9=D7  Num/ =E7  Num* =F7  Num- =G7  Num+ =A7  Num. =B7
 | 简谱 / MIDI 解析、窗口、合成 | 璇泽科技 | 见 LICENSE |
 
 ---
+
+## 变更记录
+
+版本演进、修过哪些坑、怎么验证的，见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可
 
