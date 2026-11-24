@@ -1,9 +1,18 @@
 ﻿# 璇泽科技 · DSH 钢琴（dsh-piano）
 
 一台标准 **88 键**电脑钢琴，挂载在 DeepSeek Harness 上。
+**钢琴之外还能换成 128 种乐器** —— 大提琴、弦乐、长笛、口琴、吉他、风琴……
 
 **核心不是"能响"，是"能把一份乐谱变成一首歌"**：AI 写一份乐谱文本（或直接读一份
-MIDI 文件）→ 插件解析成时间轴 → 按标准钢琴音色弹出来。谱就是歌，文件就是作品。
+MIDI 文件）→ 插件解析成时间轴 → 按你选的音色弹出来 → 想要成品就导出成 WAV。
+谱就是歌，文件就是作品。
+
+| | |
+|---|---|
+| **128 音色** | 钢琴（Yamaha 88 键每键采样）+ 127 种 General MIDI 乐器 |
+| **8 个工具** | AI 直接写谱、读 MIDI、切乐器、导出音频 |
+| **离线导出** | 几百倍速渲染成 WAV，不走扬声器 |
+| **零依赖** | 不需要 npm、不需要编译，`PianoWindow.exe` 已入库 |
 
 ![DSH 钢琴](docs/interface.png)
 
@@ -16,7 +25,7 @@ MIDI 文件）→ 插件解析成时间轴 → 按标准钢琴音色弹出来。
 **三步**，不需要装 Node、不需要编译：
 
 ```powershell
-git clone https://github.com/XuanzeNetDev/dsh-piano.git
+git clone https://github.com/XuanzeTech/dsh-piano.git
 cd dsh-piano
 .\install.ps1          # 链接到 DSH profile + 检查音源 + 编译缺失的 EXE
 ```
