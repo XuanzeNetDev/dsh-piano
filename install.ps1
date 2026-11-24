@@ -89,4 +89,4 @@ if (Test-Path $exe) {
 
 Write-Host ""
 Write-Host "完成。重启 DSH 后，在插件列表里启用「DSH 钢琴」。" -ForegroundColor Cyan
-Write-Host "网页右下角会出现「● 钢琴」胶囊。" -ForegroundColor Cyan
+Write-Host "会话标题栏右上角会出现「● 钢琴」胶囊 + 乐器选择器。" -ForegroundColor Cyan

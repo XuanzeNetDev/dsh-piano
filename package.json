@@ -2,7 +2,7 @@
   "name": "dsh-piano-xz",
   "version": "2.2.0",
   "private": true,
-  "description": "璇泽科技 · DSH 电脑钢琴：标准 88 键钢琴 + GM 128 音色，AI 用工具弹，网页右下角看得见也听得见",
+  "description": "璇泽科技 · DSH 电脑钢琴：标准 88 键钢琴 + GM 128 音色，AI 用工具写谱/读 MIDI/切乐器/导出 WAV",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -28,6 +28,7 @@
     "icon.svg",
     "README.md",
     "COMMERCIAL.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dsh": {

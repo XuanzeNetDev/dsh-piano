@@ -11,7 +11,7 @@
  *   3. /api/dsh-piano-xz/*：浏览器半侧来取时间轴、点曲子、看状态
  *
  * 宿主不发声（服务端没扬声器），它只排「第几毫秒该响哪个键多大声」，
- * 声音由浏览器用 WebAudio 现场合成为钢琴音色。
+ * 声音由独立窗口（PianoWindow.exe）发出：钢琴用 Yamaha 每键采样，其余 127 种用 GM 音源。
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync, appendFileSync } from 'node:fs'
@@ -98,7 +98,7 @@ const SCORE_DESCRIPTION = `把一份乐谱文本变成一首歌。
 
 ${SCORE_FORMAT}
 
-演奏是排给浏览器的那台钢琴的：面板没开也会出声，打开右下角键盘能看到琴键按下去。`
+演奏是排给独立窗口的：窗口没开会自动拉起。也可以在界面上用乐器选择器换音色（128 种）。`
 
 const PLAY_DESCRIPTION = `当场弹一段，不落盘。参数和 piano_score 的 text 完全一样（简谱 / 音名都行）。
 谱要留档、要反复弹，用 piano_score 写成文件。
