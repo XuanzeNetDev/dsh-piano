@@ -198,6 +198,14 @@ namespace DshPiano
         [DllImport("kernel32.dll")]
         public static extern IntPtr GetModuleHandle(string lpModuleName);
 
+        /// <summary>
+        /// 查某个键当前是不是按下的。
+        /// 低级键盘钩子回调里拿不到修饰键状态（lParam 只有 keyCode + 标志位），
+        /// Ctrl 得单独查。0x11 = VK_CONTROL，0x8000 位表示"正按下"。
+        /// </summary>
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
+
         public delegate bool EnumProc2(IntPtr h, IntPtr l);
         // ── 窗口位置事件钩子 ──
         // 轮询（哪怕 30ms）快速拖动时一定会滞后；事件驱动是 DS H 一动就回调，零延迟。
@@ -275,6 +283,8 @@ namespace DshPiano
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
         public const uint WM_CLOSE = 0x0010;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -365,6 +375,43 @@ namespace DshPiano
         const int BarH = 36;   // 顶栏高度：26 太扁，文字挤在一起\n        const int BarPad = 6;
 
         Rectangle btnPlay, btnClose;    // btnPlay = 暂停/继续切换
+        Rectangle btnPrev, btnNext, btnMode;   // 播放列表：上一首 / 下一首 / 模式
+        Rectangle btnFolder;                   // 选文件夹
+        Rectangle btnKeys;                     // 「键盘」开关：允不允许用电脑键盘弹琴
+
+        /// <summary>
+        /// 键盘弹奏开关。**默认关**。
+        ///
+        /// 为什么默认关：这套映射吞掉了 Z X C V B N M / A S D F G H J / Q W E R T Y U / 1-7
+        /// —— 基本就是标准键盘的三大排。开着它就等于"打字全靠鼠标"，
+        /// 在任何程序里都打不了字（它装的是全局钩子）。
+        ///
+        /// 想用键盘弹琴时点一下标题栏的「键盘」按钮，弹完再点回来。
+        /// </summary>
+        bool keyboardPlay = false;
+
+        /// <summary>
+        /// 播放列表状态（从宿主 /playlist/state 拉回来）。
+        ///
+        /// EXE 不自己维护列表 —— 目录扫描和 MIDI 解析都在 Node 那边，
+        /// 这里只存一份"显示用"的副本，每秒刷新。
+        /// </summary>
+        sealed class PlState
+        {
+            public string Dir = "";
+            public int Count;
+            public int Index = -1;
+            public string File = "";
+            public string Name = "";
+            public string Mode = "order";
+            public bool Playing;
+            public double Seconds;
+            public double Elapsed;
+            public bool Finished;
+            public string Error = "";
+        }
+        PlState pl = new PlState();
+        DateTime plFetchedAt = DateTime.MinValue;
         bool paused;
         long pumpTick;
         long pauseOffset;               // 累计暂停时长（毫秒）
@@ -475,6 +522,23 @@ namespace DshPiano
 
         int barH = BarH;
 
+        /// <summary>
+        /// 退出时摘掉全局钩子。
+        ///
+        /// 不摘的话：进程退了但钩子还可能挂着（系统会清理，但日志里看得到残留），
+        /// 而且调试时反覆启动会积累一堆。
+        /// </summary>
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            if (!kbdHookRemoved && kbdHook != IntPtr.Zero)
+            {
+                try { Native.UnhookWindowsHookEx(kbdHook); } catch { }
+                kbdHookRemoved = true;
+                Audio.Log("HOOK 已摘");
+            }
+            base.OnFormClosed(e);
+        }
+
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
@@ -489,14 +553,56 @@ namespace DshPiano
             if (snapped)
             {
                 ApplyDragLock(true);
-                ApplyTopMost(true);
+                ApplyTopMost(WantTopMost());
             }
 
             StartFollow();
+
+            // ── 全局键盘钩子 ──
+            //
+            // 这个原来只有定义、从来没被调用过 —— 所以"失焦也能弹琴"和
+            // "Ctrl+方向键全局生效"其实一直没工作过，只有窗口有焦点时才响应。
+            //
+            // 装上之后：
+            //   · 整个键盘能当钢琴弹（窗口失焦也有效）
+            //   · Ctrl+←→ 切歌、Ctrl+↑↓ 换乐器，不管焦点在 DSH 还是钢琴都行
+            // 只吞自己映射过的键，其余放行（见 KbdCallback 里的判断）。
+            InstallKeyboardHook();
+
             tickTimer = new System.Windows.Forms.Timer { Interval = 8 };
             tickTimer.Tick += (s, a) => Pump();
             tickTimer.Start();
             Poll();
+
+            // ── 自动加载上次的音乐目录 ──
+            //
+            // 放在后台线程里做：扫描 90 个 MIDI 要读 90 个文件，
+            // 在主线程做窗口会卡一下才开始画。
+            //
+            // 只在"目录还有效"时加载 —— 用户可能把文件夹删了或改名了，
+            // 那种情况安静地什么都不做（界面上还是显示「打开文件夹」），
+            // 而不是弹个错误框打断启动。
+            string savedDir = LoadMusicDirSetting();
+            if (!string.IsNullOrEmpty(savedDir) && System.IO.Directory.Exists(savedDir))
+            {
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        PlOpen(savedDir);
+                        Audio.Log("PL 自动加载上次目录 " + savedDir);
+                    }
+                    catch (Exception ex)
+                    {
+                        Audio.Log("PL 自动加载失败 " + ex.Message);
+                    }
+                });
+            }
+            else if (!string.IsNullOrEmpty(savedDir))
+            {
+                Audio.Log("PL 上次的目录不在了（" + savedDir + "），请在界面里重新选");
+                SaveMusicDirSetting("");
+            }
         }
 
         void Poll()
@@ -597,6 +703,14 @@ namespace DshPiano
                             primed = true;
                         }
 
+
+                    // ── 播放列表状态 ──
+                    // 每秒拉一次：更新曲名/进度，顺便判断"播完该下一首了"。
+                    // 放在渲染任务之前，这样自动切歌的请求能早一点发出去。
+                    if (presetTick % 10 == 2)
+                    {
+                        try { FetchPlState(); } catch { }
+                    }
 
                     // ── 离线渲染任务 ──
                     // 宿主把待渲染的时间轴放在 /render/pending，这里取回来渲染成 WAV。
@@ -835,8 +949,72 @@ namespace DshPiano
                 int msg = wParam.ToInt32();
                 bool down = msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN;
 
+                // ── Ctrl + 方向键：全局生效（不管焦点在 DSH 还是钢琴窗口）──
+                //
+                //   Ctrl+← → 上一首       Ctrl+→ → 下一首
+                //   Ctrl+↑ → 上一个乐器   Ctrl+↓ → 下一个乐器
+                //
+                // 为什么放全局钩子，而不是原来的 OnKeyDown：
+                //   OnKeyDown 只在钢琴窗口有焦点时触发。用户在 DSH 里打字 / 点按钮时
+                //   焦点在 DSH 上，按 Ctrl+←→ 切不了歌 —— 得先点一下钢琴窗口才行，
+                //   而换乐器（网页那套）又是相反的规则。两套逻辑各管一半，很别扭。
+                //
+                // 现在统一：这两组键**只认 Ctrl**，全局拦截，两边行为一致。
+                // 不带 Ctrl 的方向键仍然是八度切换（那是在窗口里弹琴时才用的）。
+                // ── 修饰键全放行，除非是我们认的那几种 ──
+                //
+                // 低级钩子最怕"无条件吞键"：吞了 Alt/Win 组合，
+                // Win+Shift+S（系统截图）、Win+E、Alt+Tab 全都会失效 ——
+                // 用户装个钢琴插件把系统快捷键搞坏，那是绝对不能接受的。
+                //
+                // 规则：
+                //   · 有 Alt  → 一律放行（Alt+F4 / Alt+Tab / 菜单键）
+                //   · 有 Win  → 一律放行（Win+Shift+S / Win+E / Win+D 全是系统键）
+                //   · 有 Ctrl  → 只接管方向键那 4 个，其他（Ctrl+C/V/S）放行
+                //   · 无修饰   → 只有"键盘弹奏开关"开着时才拦
+                bool altDown = (Native.GetAsyncKeyState(0x12) & 0x8000) != 0;
+                bool winDown = (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0
+                            || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+                if (altDown || winDown)
+                    return Native.CallNextHookEx(kbdHook, nCode, wParam, lParam);
+
+                bool ctrlDown = (Native.GetAsyncKeyState(0x11) & 0x8000) != 0;
+
+                // ── 只在自己人身上拦 ──
+                //
+                // 这是全局低级钩子，如果无条件吞掉 Ctrl+←→，
+                // 用户在浏览器里按"后退"、在编辑器里按"按词跳"全都会失效 ——
+                // 装个钢琴插件就把系统快捷键搞坏，那是不能接受的。
+                //
+                // 所以只在"前台窗口是钢琴窗口或 DSH 主窗口"时接管。
+                // 焦点在别的程序时原样放行。
+                bool ours = IsForegroundOurs();
+                if (down && ctrlDown && ours
+                    && (vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28))
+                {
+                    // 去重：按住不放会连续发 KEYDOWN，只认第一次
+                    if (kbdDown.Add(vk))
+                    {
+                        string what;
+                        if (vk == 0x25) what = "prev";
+                        else if (vk == 0x27) what = "next";
+                        else what = vk == 0x26 ? "instUp" : "instDown";
+                        Audio.Log("HOTKEY Ctrl+" + what);
+                        ThreadPool.QueueUserWorkItem(_ => RunHotkey(what));
+                    }
+                    return (IntPtr)1;      // 吞掉，别让浏览器/编辑器也响应
+                }
+                if (!down && ctrlDown && (vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28))
+                {
+                    kbdDown.Remove(vk);
+                    return (IntPtr)1;
+                }
+
                 // 八度切换：← 降、→ 升（范围 -2..+2）
-                if (down && (vk == 0x25 || vk == 0x27))
+                //
+                // 同样要受 keyboardPlay 控制 —— 这两组键不带修饰，
+                // 如果无条件吞掉，用户在别的程序里用方向键就失灵了。
+                if (down && keyboardPlay && (vk == 0x25 || vk == 0x27))
                 {
                     kbdOctave = Math.Max(-2, Math.Min(2, kbdOctave + (vk == 0x27 ? 1 : -1)));
                     Audio.Log("KBD octave=" + kbdOctave);
@@ -844,8 +1022,10 @@ namespace DshPiano
                     return (IntPtr)1;      // 吞掉，别再触发系统行为
                 }
 
+                // 键盘弹奏：只有开关开着才拦。
+                // 关着的时候这些字母原样交给前台程序 —— 正常打字不受影响。
                 int semi;
-                if (KeyMap.Semitone.TryGetValue(vk, out semi))
+                if (keyboardPlay && !ctrlDown && KeyMap.Semitone.TryGetValue(vk, out semi))
                 {
                     if (down)
                     {
@@ -907,6 +1087,9 @@ namespace DshPiano
                 }
 
                 if (!Visible) { Show(); Audio.Log("HOST restored -> show"); }
+
+                // 置顶跟随：DSH 在前台才置顶，别的程序在前台就退下去。
+                SyncTopMostWithHost();
 
                 // 兜底：统一走 SnapToHost。
                 // 这里原来还留着一份最早期的手写钳制（wa.Left / wa.Top），
@@ -1045,10 +1228,13 @@ namespace DshPiano
                     // 第一次：绝对对齐一次，作为基准
                     lastHostX = hostX; lastHostY = hostY; lastHostW = hostW; lastHostH = hostH;
                     int t0 = ChooseTop(hostX, hostY, hostW);
-                    Native.SetWindowPos(Handle, snapped ? Native.HWND_TOPMOST : IntPtr.Zero,
-                        hostX, t0, hostW, Height,
-                        Native.SWP_NOACTIVATE | Native.SWP_NOSENDCHANGING
-                        | (snapped ? 0u : Native.SWP_NOZORDER));
+                    // z 序：只有"DSH 或自己在前台"时才 TOPMOST。
+                    // 别在这里无条件设 TOPMOST —— 那会让钢琴永远压在
+                    // 浏览器、编辑器、视频播放器上面，桌面没法用。
+                    IntPtr hwndAfter = WantTopMost() ? Native.HWND_TOPMOST : IntPtr.Zero;
+                    uint flags0 = Native.SWP_NOACTIVATE | Native.SWP_NOSENDCHANGING;
+                    if (hwndAfter == IntPtr.Zero) flags0 |= Native.SWP_NOZORDER;
+                    Native.SetWindowPos(Handle, hwndAfter, hostX, t0, hostW, Height, flags0);
                     setLeft = hostX; setTop = t0; setW = hostW;
                     lastAbove = t0 < hostY;
                     return;
@@ -1077,9 +1263,10 @@ namespace DshPiano
                 setLeft = newLeft; setTop = newTop; setW = newW;
                 // 吸附时用 HWND_TOPMOST 并重申：光有 WS_EX_TOPMOST 位不够，
                 // 同层内还有顺序，DSH 最大化/切前台都可能把钢琴压到后面。
-                Native.SetWindowPos(Handle, snapped ? Native.HWND_TOPMOST : IntPtr.Zero,
-                    newLeft, newTop, newW, Height,
-                    Native.SWP_NOACTIVATE | Native.SWP_NOSENDCHANGING);
+                IntPtr after = WantTopMost() ? Native.HWND_TOPMOST : IntPtr.Zero;
+                uint flags = Native.SWP_NOACTIVATE | Native.SWP_NOSENDCHANGING;
+                if (after == IntPtr.Zero) flags |= Native.SWP_NOZORDER;
+                Native.SetWindowPos(Handle, after, newLeft, newTop, newW, Height, flags);
             }
             finally { snapping = false; }
         }
@@ -1224,9 +1411,16 @@ namespace DshPiano
             int rightZone = 170;                       // 右侧信息+按钮占位
             // "钢琴"两字（9pt 粗体）从 x=23 起，实际占到 x≈64，起点必须让过去，
             // 否则首字母会被压掉（之前显示成 "lower-Dance-…" 就是这个）。
+            // 播放列表在播时，标题优先显示「歌名 · 3/90」——
+            // 用户需要知道"现在第几首、还剩几首"，这比内部标签有用。
+            string titleText = nowPlaying;
+            if (pl.Count > 0 && pl.Index >= 0 && !string.IsNullOrEmpty(pl.Name))
+            {
+                titleText = pl.Name + "   " + (pl.Index + 1) + "/" + pl.Count;
+            }
             int stillX = 74;
             int stillMax = Math.Max(0, w - rightZone - stillX);
-            if (!string.IsNullOrEmpty(nowPlaying) && stillMax > 60)
+            if (!string.IsNullOrEmpty(titleText) && stillMax > 60)
             {
                 using (var sf = new StringFormat
                 {
@@ -1234,13 +1428,89 @@ namespace DshPiano
                     FormatFlags = StringFormatFlags.NoWrap,
                     LineAlignment = StringAlignment.Center,
                 })
-                    g.DrawString(nowPlaying, fTitle, bTitle, new RectangleF(stillX, 0f, stillMax, barH), sf);
+                    g.DrawString(titleText, fTitle, bTitle, new RectangleF(stillX, 0f, stillMax, barH), sf);
             }
 
             // 右侧：曲信息（从右往左排，不重叠）+ 两个按钮
             int bw = 30, bh = 19, by = (barH - bh) / 2;
             btnClose = new Rectangle(w - bw - 9, by, bw, bh);
             btnPlay = new Rectangle(w - bw * 2 - 15, by, bw, bh);
+
+            // ── 播放列表按钮（从右往左：⏮ ⏭ 模式）──
+            //   ⏮ 上一首   ⏭ 下一首   模式（顺序/单曲/随机，点一下切一圈）
+            // 只在列表有歌时显示 —— 空列表摆三个灰按钮没意义。
+            bool hasList = pl.Count > 0;
+            btnFolder = Rectangle.Empty;
+            if (hasList)
+            {
+                // 从右往左排，所以：越靠右 Left 越大。
+                // ⏭（下一首）紧挨着播放键，⏮（上一首）在它左边 ——
+                // 屏幕上从左到右就是 ◀◀ ▶▶，符合播放器的通用排布。
+                btnNext = new Rectangle(btnPlay.Left - bw - 6, by, bw, bh);
+                btnPrev = new Rectangle(btnPlay.Left - bw * 2 - 12, by, bw, bh);
+                DrawButton(g, btnPrev, "", Color.FromArgb(208, 218, 234), false);
+                DrawButton(g, btnNext, "", Color.FromArgb(208, 218, 234), false);
+                // 图标自绘：◀◀ 和 ▶▶（两对三角），
+                using (var b = new SolidBrush(Color.FromArgb(214, 226, 242)))
+                {
+                    float cx = btnPrev.Left + btnPrev.Width / 2f;
+                    float cy = btnPrev.Top + btnPrev.Height / 2f;
+                    for (int k = 0; k < 2; k++)
+                    {
+                        float ox = cx - 5f + k * 6f;
+                        g.FillPolygon(b, new PointF[]
+                        {
+                            new PointF(ox + 4f, cy - 4.5f),
+                            new PointF(ox + 4f, cy + 4.5f),
+                            new PointF(ox - 1f, cy),
+                        });
+                    }
+                    cx = btnNext.Left + btnNext.Width / 2f;
+                    for (int k = 0; k < 2; k++)
+                    {
+                        float ox = cx - 5f + k * 6f;
+                        g.FillPolygon(b, new PointF[]
+                        {
+                            new PointF(ox, cy - 4.5f),
+                            new PointF(ox, cy + 4.5f),
+                            new PointF(ox + 5f, cy),
+                        });
+                    }
+                }
+
+                // 模式按钮：文字比图标清楚，顺序/单曲/随机各一个字
+                string modeTxt = pl.Mode == "one" ? "单" : (pl.Mode == "shuffle" ? "随" : "顺");
+                var msz = g.MeasureString(modeTxt, fInfo);
+                int mbw = Math.Max(bw, (int)msz.Width + 12);
+                btnMode = new Rectangle(btnPrev.Left - mbw - 6, by, mbw, bh);
+                DrawButton(g, btnMode, modeTxt, Color.FromArgb(198, 210, 230), false);
+
+                // 「换目录」：有列表时也要能重新选一个文件夹，
+                // 不然记住上次目录之后就没路换走了。
+                string dirTxt = "换目录";
+                var dsz = g.MeasureString(dirTxt, fInfo);
+                int dbw = (int)dsz.Width + 12;
+                btnFolder = new Rectangle(btnMode.Left - dbw - 6, by, dbw, bh);
+                DrawButton(g, btnFolder, dirTxt, Color.FromArgb(198, 210, 230), false);
+
+                // 「键盘」：允不允许用电脑键盘弹琴（默认关，见 keyboardPlay 注释）。
+                // 放在最左边 —— 它是最不常用的一个，而且开启时要有明显标识：
+                // 开着用绿底，跟"吸附中"一样醒目，提醒用户"现在打字会变成弹琴"。
+                DrawKeyboardBtn(g, btnFolder.Left, by, bh);
+            }
+            else
+            {
+                btnPrev = btnNext = btnMode = Rectangle.Empty;
+                // 没列表时给一个「打开文件夹」入口，不然用户不知道从哪开始
+                string folderTxt = "打开文件夹";
+                var fsz = g.MeasureString(folderTxt, fInfo);
+                int fbw = (int)fsz.Width + 16;
+                btnFolder = new Rectangle(btnPlay.Left - fbw - 6, by, fbw, bh);
+                DrawButton(g, btnFolder, folderTxt, Color.FromArgb(208, 218, 234), false);
+
+                // 没列表时也要有「键盘」开关
+                DrawKeyboardBtn(g, btnFolder.Left, by, bh);
+            }
             DrawButton(g, btnPlay, "", Color.FromArgb(208, 218, 234), false);
             // 播放/暂停图标自绘：
             // 字符 "❚❚" 的两竖间距由字体决定，改不了；自己画两条线才能控制。
@@ -1270,7 +1540,16 @@ namespace DshPiano
             }
             DrawButton(g, btnClose, "✕", Color.FromArgb(208, 218, 234), true);
 
-            int infoRight = btnPlay.Left - 12;
+            // 信息区（速度/拍号/调号/吸附）从「最左边那个按钮」的左边开始排。
+            //
+            // 原来写死 btnPlay.Left - 12，加了「打开文件夹」/「模式」这些按钮之后
+            // 它们比 btnPlay 更靠左，信息区还从 btnPlay 算，
+            // 结果吸附按钮和「打开文件夹」画在同一个位置 —— 看起来就是两个控件叠在一起。
+            int leftMostBtn = btnPlay.Left;
+            if (btnMode != Rectangle.Empty && btnMode.Left < leftMostBtn) leftMostBtn = btnMode.Left;
+            if (btnFolder != Rectangle.Empty && btnFolder.Left < leftMostBtn) leftMostBtn = btnFolder.Left;
+            if (btnKeys != Rectangle.Empty && btnKeys.Left < leftMostBtn) leftMostBtn = btnKeys.Left;
+            int infoRight = leftMostBtn - 12;
             {
                 // 速度
                 if (scoreBpm > 0)
@@ -1496,6 +1775,48 @@ namespace DshPiano
             return p;
         }
 
+        /// <summary>
+        /// 画「键盘」开关。
+        ///
+        /// 两个状态要一眼分得清（这个开关关系到"打字会不会变成弹琴"，不能含糊）：
+        ///   禁用 → 文字灰、一道红叉划过
+        ///   启用 → 文字白亮、底色泛绿
+        ///
+        /// leftOfPrev 是右边那个按钮的左边界，本按钮往左排。
+        /// </summary>
+        void DrawKeyboardBtn(Graphics g, int leftOfPrev, int by, int bh)
+        {
+            string txt = "键盘";
+            var sz = g.MeasureString(txt, fInfo);
+            int w = (int)sz.Width + 14;
+            btnKeys = new Rectangle(leftOfPrev - w - 6, by, w, bh);
+
+            Color fg = keyboardPlay
+                ? Color.FromArgb(226, 255, 240)      // 启用：白亮
+                : Color.FromArgb(118, 136, 156);     // 禁用：灰
+            DrawButton(g, btnKeys, txt, fg, false);
+
+            // 启用时给底色铺一层淡绿，提示"现在是开着的"
+            if (keyboardPlay)
+            {
+                using (var b = new SolidBrush(Color.FromArgb(70, 74, 222, 158)))
+                    g.FillPath(b, RoundRect(btnKeys, 5f));
+                DrawButton(g, btnKeys, txt, fg, false);
+            }
+
+            // 禁用：一道红斜线，从左下到右上
+            if (!keyboardPlay)
+            {
+                var old = g.SmoothingMode;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                using (var pen = new Pen(Color.FromArgb(215, 232, 76, 76), 1.7f))
+                    g.DrawLine(pen,
+                        btnKeys.Left + 2, btnKeys.Bottom - 3,
+                        btnKeys.Right - 2, btnKeys.Top + 3);
+                g.SmoothingMode = old;
+            }
+        }
+
         static void DrawButton(Graphics g, Rectangle r, string glyph, Color fg, bool hot)
         {
             Color top = hot ? Color.FromArgb(120, 38, 46, 60) : Color.FromArgb(48, 58, 74);
@@ -1547,6 +1868,271 @@ namespace DshPiano
         }
 
         /// <summary>彻底停下：请求宿主清队列、掐掉本地声音、清高亮。</summary>
+        /// <summary>
+        /// 选一个文件夹当音乐目录。
+        ///
+        /// 用 .NET 自带的 FolderBrowserDialog —— 不引第三方库，
+        /// 也不自己画目录树（那得好几百行，还要处理权限和网络路径）。
+        /// </summary>
+        void PickFolder()
+        {
+            using (var dlg = new FolderBrowserDialog())
+            {
+                dlg.Description = "选一个装着 MIDI 文件的文件夹";
+                dlg.ShowNewFolderButton = false;
+                if (!string.IsNullOrEmpty(pl.Dir) && System.IO.Directory.Exists(pl.Dir))
+                    dlg.SelectedPath = pl.Dir;
+                else if (System.IO.Directory.Exists(@"F:\midi"))
+                    dlg.SelectedPath = @"F:\midi";
+
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                PlOpen(dlg.SelectedPath);
+            }
+        }
+
+        /// <summary>打开目录并扫描（走宿主，因为 MIDI 解析在那边）。</summary>
+        void PlOpen(string dir)
+        {
+            try
+            {
+                string u = api + "/playlist/open?dir=" + Uri.EscapeDataString(dir);
+                var req = (System.Net.HttpWebRequest)WebRequest.Create(u);
+                req.Method = "POST";
+                req.Timeout = 15000;
+                req.ServicePoint.Expect100Continue = false;
+                string json;
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    json = sr.ReadToEnd();
+
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var d = ser.Deserialize<Dictionary<string, object>>(json);
+                if (d == null || !d.ContainsKey("ok") || !Convert.ToBoolean(d["ok"]))
+                {
+                    pl.Error = d != null && d.ContainsKey("error") ? Convert.ToString(d["error"]) : "打不开";
+                    Audio.Log("PL OPEN fail: " + pl.Error);
+                    Invalidate();
+                    return;
+                }
+                pl.Dir = d.ContainsKey("dir") ? Convert.ToString(d["dir"]) : dir;
+                pl.Count = d.ContainsKey("count") ? Convert.ToInt32(d["count"]) : 0;
+                pl.Index = 0;
+                // 记住这个目录 —— 下次启动直接用它，不用再选一遍
+                SaveMusicDirSetting(pl.Dir);
+                Audio.Log("PL OPEN " + pl.Dir + "  共 " + pl.Count + " 首");
+                FetchPlState();
+                Invalidate();
+            }
+            catch (Exception ex)
+            {
+                pl.Error = ex.Message;
+                Audio.Log("PL OPEN err " + ex.GetType().Name + ": " + ex.Message);
+                Invalidate();
+            }
+        }
+
+        /// <summary>切歌。dir = next / prev / 数字。</summary>
+        void PlGoto(string dir)
+        {
+            try
+            {
+                string u = api + "/playlist/goto?dir=" + Uri.EscapeDataString(dir);
+                var req = (System.Net.HttpWebRequest)WebRequest.Create(u);
+                req.Method = "POST";
+                req.Timeout = 15000;
+                req.ServicePoint.Expect100Continue = false;
+                string json;
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    json = sr.ReadToEnd();
+
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var d = ser.Deserialize<Dictionary<string, object>>(json);
+                if (d != null && d.ContainsKey("ok") && Convert.ToBoolean(d["ok"]))
+                {
+                    Audio.Log("PL GOTO " + dir + " → " + (d.ContainsKey("file") ? Convert.ToString(d["file"]) : "?"));
+                    // 切歌后重置暂停状态 —— 不然新歌一进来就是冻着的
+                    paused = false;
+                    pausedAt = 0;
+                }
+                else
+                {
+                    Audio.Log("PL GOTO fail: " + (d != null && d.ContainsKey("error") ? Convert.ToString(d["error"]) : "?"));
+                }
+                FetchPlState();
+                Invalidate();
+            }
+            catch (Exception ex) { Audio.Log("PL GOTO err " + ex.Message); }
+        }
+
+        /// <summary>切模式。</summary>
+        void PlSetMode(string mode)
+        {
+            try
+            {
+                string u = api + "/playlist/mode?mode=" + mode;
+                var req = (System.Net.HttpWebRequest)WebRequest.Create(u);
+                req.Method = "POST";
+                req.Timeout = 8000;
+                req.ServicePoint.Expect100Continue = false;
+                using (var resp = req.GetResponse()) { }
+                pl.Mode = mode;
+                Audio.Log("PL MODE → " + mode);
+                Invalidate();
+            }
+            catch (Exception ex) { Audio.Log("PL MODE err " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 前台窗口是不是"我们的人"（钢琴自己，或它吸附的 DSH 主窗口）。
+        ///
+        /// 全局钩子必须靠这个判断收窄范围，否则会把别的软件的
+        /// Ctrl+←→ 也吃掉（浏览器后退、编辑器按词跳）。
+        /// </summary>
+        bool IsForegroundOurs()
+        {
+            try
+            {
+                IntPtr fg = Native.GetForegroundWindow();
+                if (fg == IntPtr.Zero) return false;
+                if (fg == Handle) return true;                    // 钢琴窗口自己
+                if (hostHwnd != IntPtr.Zero && fg == hostHwnd) return true;   // DSH 主窗口
+
+                // Electron 的焦点窗口可能是子窗口 —— 往上找到顶层再比
+                IntPtr root = Native.GetAncestor(fg, 2 /* GA_ROOT */);
+                if (root != IntPtr.Zero) return root == Handle || root == hostHwnd;
+                return false;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 执行一条快捷键动作。
+        ///
+        /// 为什么统一走这里：切歌和换乐器都要发 HTTP，
+        /// 而且都得在后台线程（钩子回调里不能阻塞）。
+        /// 集中一处，加新快捷键只要加一个分支。
+        ///
+        /// 参数：
+        ///   prev / next      → 播放列表上一首 / 下一首
+        ///   instUp / instDown → GM 乐器上一个 / 下一个
+        /// </summary>
+        void RunHotkey(string what)
+        {
+            try
+            {
+                switch (what)
+                {
+                    case "prev":
+                        BeginInvoke(new Action(() => PlGoto("prev")));
+                        break;
+                    case "next":
+                        BeginInvoke(new Action(() => PlGoto("next")));
+                        break;
+                    case "instUp":
+                        StepInstrument(-1);
+                        break;
+                    case "instDown":
+                        StepInstrument(1);
+                        break;
+                }
+            }
+            catch (Exception ex) { Audio.Log("HOTKEY err " + what + ": " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 换乐器（±1），范围 0..127 循环。
+        ///
+        /// 走宿主的 /instrument，不自己改 GmEngine ——
+        /// 宿主那边的 gmPreset 是权威，网页上的下拉框也读它。
+        /// 如果这里直接改本地，网页那边就不同步了（你会看到上面写 10、
+        /// 下面还在 20 的怪现象）。
+        /// </summary>
+        void StepInstrument(int delta)
+        {
+            try
+            {
+                int cur = GmEngine.CurrentProgram;
+                int next = cur + delta;
+                if (next < 0) next = 127;
+                if (next > 127) next = 0;
+
+                string u = api + "/instrument?program=" + next;
+                var req = (System.Net.HttpWebRequest)WebRequest.Create(u);
+                req.Method = "POST";
+                req.Timeout = 8000;
+                req.ServicePoint.Expect100Continue = false;
+                using (var resp = req.GetResponse()) { }
+
+                // 立刻切本地，不等下一轮 /preset 轮询 —— 否则按键手感有明显延迟
+                GmEngine.SetProgram(next);
+                SaveStateSetting();
+                Audio.Log("HOTKEY inst → " + next + " "
+                          + (GmEngine.Current != null ? GmEngine.Current.Name : "?"));
+                BeginInvoke(new Action(Invalidate));
+            }
+            catch (Exception ex) { Audio.Log("HOTKEY inst err " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 拉播放列表状态。
+        ///
+        /// 每秒调用一次（跟 /preset 同一个轮询节奏）。
+        /// 顺便做"播完自动下一首"的判断 —— 放在这里而不是播放泵里，
+        /// 因为需要"这首歌多长"这个信息，那个只有宿主知道。
+        /// </summary>
+        void FetchPlState()
+        {
+            try
+            {
+                var req = (System.Net.HttpWebRequest)WebRequest.Create(api + "/playlist/state");
+                req.Method = "GET";
+                req.Timeout = 8000;
+                req.ServicePoint.Expect100Continue = false;
+                string json;
+                using (var resp = req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    json = sr.ReadToEnd();
+
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var d = ser.Deserialize<Dictionary<string, object>>(json);
+                if (d == null) return;
+
+                int prevCount = pl.Count, prevIndex = pl.Index;
+                bool wasPlaying = pl.Playing;
+
+                pl.Count = d.ContainsKey("count") ? Convert.ToInt32(d["count"]) : 0;
+                pl.Index = d.ContainsKey("index") ? Convert.ToInt32(d["index"]) : -1;
+                pl.File = d.ContainsKey("file") ? Convert.ToString(d["file"]) : "";
+                pl.Name = d.ContainsKey("name") ? Convert.ToString(d["name"]) : "";
+                pl.Mode = d.ContainsKey("mode") ? Convert.ToString(d["mode"]) : "order";
+                pl.Playing = d.ContainsKey("playing") && Convert.ToBoolean(d["playing"]);
+                pl.Seconds = d.ContainsKey("seconds") ? Convert.ToDouble(d["seconds"]) : 0;
+                pl.Elapsed = d.ContainsKey("elapsed") ? Convert.ToDouble(d["elapsed"]) : 0;
+                pl.Finished = d.ContainsKey("finished") && Convert.ToBoolean(d["finished"]);
+                if (d.ContainsKey("dir")) pl.Dir = Convert.ToString(d["dir"]);
+                plFetchedAt = DateTime.UtcNow;
+
+                // ── 播完自动下一首 ──
+                // 只在"确实播完了"且"这首不是刚切过来的"时触发，
+                // 否则会出现：切歌 → 状态里 finished 还是上一首的 true → 立刻又切一次。
+                if (pl.Finished && pl.Playing && pl.Count > 1)
+                {
+                    Audio.Log("PL AUTO next（上一首播完）");
+                    PlGoto("next");
+                    return;
+                }
+
+                if (prevCount != pl.Count || prevIndex != pl.Index || wasPlaying != pl.Playing)
+                    Invalidate();
+            }
+            catch (Exception ex)
+            {
+                // 宿主没起来时这里会一直失败，不刷日志
+                pl.Error = ex.Message;
+            }
+        }
+
         void StopAll()
         {
             try
@@ -1567,6 +2153,7 @@ namespace DshPiano
         // 委托会被 GC 回收，原生层回调到已释放的地址，进程直接崩。
         IntPtr kbdHook = IntPtr.Zero;
         Native.KbdProc kbdProc;
+        bool kbdHookRemoved;
         int kbdOctave;                  // 键盘整体移调（八度）
         readonly HashSet<int> kbdDown = new HashSet<int>();   // 已按下的键（防自动重复）
 
@@ -1652,6 +2239,40 @@ namespace DshPiano
                 Close();
                 return;
             }
+            // ── 播放列表按钮 ──
+            if (btnKeys != Rectangle.Empty && btnKeys.Contains(e.Location))
+            {
+                keyboardPlay = !keyboardPlay;
+                // 立刻清掉还按着的键，不然关掉时会有音卡住
+                if (!keyboardPlay) { kbdDown.Clear(); Audio.AllOff(); }
+                Audio.Log("KEYBOARD play=" + keyboardPlay
+                          + (keyboardPlay ? "（打字会变成弹琴，注意）" : ""));
+                Invalidate();
+                return;
+            }
+            if (btnFolder != Rectangle.Empty && btnFolder.Contains(e.Location))
+            {
+                PickFolder();
+                return;
+            }
+            if (btnPrev != Rectangle.Empty && btnPrev.Contains(e.Location))
+            {
+                PlGoto("prev");
+                return;
+            }
+            if (btnNext != Rectangle.Empty && btnNext.Contains(e.Location))
+            {
+                PlGoto("next");
+                return;
+            }
+            if (btnMode != Rectangle.Empty && btnMode.Contains(e.Location))
+            {
+                // 点一下转一圈：顺序 → 单曲 → 随机 → 顺序
+                string next = pl.Mode == "order" ? "one" : (pl.Mode == "one" ? "shuffle" : "order");
+                PlSetMode(next);
+                return;
+            }
+
             if (btnPlay.Contains(e.Location))
             {
                 if (!paused)
@@ -1870,6 +2491,35 @@ namespace DshPiano
         }
 
         /// <summary>
+        /// 读上次打开的 MIDI 目录。没有就返回空串。
+        ///
+        /// 存目录的意义：用户多数时候只有一个音乐文件夹，
+        /// 每次打开都要走一遍"点按钮 → 浏览 → 找到那个文件夹"很烦。
+        /// 记住之后启动就自动加载，想换再点"换目录"。
+        /// </summary>
+        internal static string LoadMusicDirSetting()
+        {
+            var d = LoadSettings();
+            object v;
+            if (!d.TryGetValue("musicDir", out v) || v == null) return "";
+            try { return Convert.ToString(v).Trim(); }
+            catch { return ""; }
+        }
+
+        /// <summary>把目录存进设置。传空串等于清除。</summary>
+        internal static void SaveMusicDirSetting(string dir)
+        {
+            try
+            {
+                var d = LoadSettings();
+                if (string.IsNullOrEmpty(dir)) d.Remove("musicDir");
+                else d["musicDir"] = dir;
+                SaveSettings(d);
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// 把 forceProgram 从 settings.json 里摘掉。
         /// 只影响这一个字段，snapped / program 原样保留。
         /// </summary>
@@ -1916,11 +2566,69 @@ namespace DshPiano
         /// 注意：TOPMOST 只是一个"层"，同层内还有先后顺序，
         /// 所以每次跟随都要重新 SetWindowPos(HWND_TOPMOST) 重申一次。
         /// </summary>
+        /// <summary>
+        /// 置顶开关。
+        ///
+        /// 原来是 snobbing 无条件 HWND_TOPMOST —— 结果钢琴永远压在**所有**程序上面：
+        /// 你切到浏览器、切到 VS Code，它还在最上层挡着内容。
+        /// 装个钢琴插件把桌面搞得没法用，这不对。
+        ///
+        /// 现在的语义：只在「和 DSH 一起用」的时候置顶。
+        /// 具体由 SyncTopMostWithHost() 每 200ms 校正一次：
+        ///   · DSH 在前台（或钢琴自己是活动窗口）→ TOPMOST，保证吸附关系成立
+        ///   · 其他程序在前台 → NOTOPMOST，让钢琴自然退到后面
+        /// </summary>
         void ApplyTopMost(bool on)
         {
             if (Handle == IntPtr.Zero) return;
             Native.SetWindowPos(Handle, on ? Native.HWND_TOPMOST : Native.HWND_NOTOPMOST,
                 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+            topMostNow = on;
+        }
+
+        /// <summary>
+        /// 现在该不该置顶。
+        ///
+        /// 判据只有一个：前台窗口是不是"我们的人"（钢琴自己或 DSH）。
+        ///   · 是 → 置顶，保证吸附时钢琴不被 DSH 盖住
+        ///   · 不是 → 不置顶，让它自然退到后面（切浏览器、切 VS Code 都不挡）
+        ///
+        /// 每帧都算一次没有成本 —— 只是两次 GetForegroundWindow。
+        /// </summary>
+        bool WantTopMost()
+        {
+            if (!snapped) return false;
+            try
+            {
+                IntPtr fg = Native.GetForegroundWindow();
+                if (fg == IntPtr.Zero) return false;
+                if (fg == Handle) return true;
+                IntPtr root = Native.GetAncestor(fg, 2 /* GA_ROOT */);
+                if (root != IntPtr.Zero) fg = root;
+                if (fg == Handle) return true;
+                return hostHwnd != IntPtr.Zero && fg == hostHwnd;
+            }
+            catch { return false; }
+        }
+
+        bool topMostNow;
+        DateTime lastTopSync = DateTime.MinValue;
+
+        /// <summary>
+        /// 按"当前谁在前台"决定要不要置顶。
+        ///
+        /// 只在状态真的变化时调 SetWindowPos —— 每 200ms 无条件调一次会让
+        /// 窗口 z 序反复刷新，视觉上会闪。
+        /// </summary>
+        void SyncTopMostWithHost()
+        {
+            if (!snapped) return;                       // 没吸附就不用管
+            if (Handle == IntPtr.Zero || !Visible) return;
+            if ((DateTime.UtcNow - lastTopSync).TotalMilliseconds < 200) return;
+            lastTopSync = DateTime.UtcNow;
+
+            bool shouldTop = WantTopMost();
+            if (shouldTop != topMostNow) ApplyTopMost(shouldTop);
         }
 
         void ApplyDragLock(bool locked)
@@ -2001,6 +2709,19 @@ namespace DshPiano
             base.OnKeyDown(e);
             if (e.KeyCode == Keys.Escape) { Close(); return; }
 
+            // Ctrl+方向键（切歌 / 换乐器）统一由全局键盘钩子处理 ——
+            // 见 KbdCallback。这里不再重复，否则窗口有焦点时会触发两次。
+
+            // ── 以下全部受「键盘」开关控制 ──
+            //
+            // 这里是**第二条**发声路径：窗口有焦点时走 OnKeyDown，
+            // 窗口没焦点时走全局钩子 KbdCallback。
+            // 两条都必须判断 keyboardPlay —— 只堵一条的话，
+            // 开关显示着"关"，鼠标点一下钢琴窗口就又能弹出声，等于没关。
+            //
+            // Escape 在开关判断之前，任何时候都能关窗。
+            if (!keyboardPlay) return;
+
             // 八度切换：← 降、→ 升（±2 个八度）
             if (e.KeyCode == Keys.Left || e.KeyCode == Keys.Right)
             {
@@ -2010,8 +2731,6 @@ namespace DshPiano
                 return;
             }
 
-            // 只在窗口有焦点时响应（KeyPreview），不做全局钩子：
-            // 全局钩子会吞掉 Q/W/E/2/3 这些打字键，开着钢琴就没法打字了。
             int semi;
             int vk = (int)e.KeyCode;
             bool shift = (Control.ModifierKeys & Keys.Shift) == Keys.Shift;

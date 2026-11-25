@@ -205,6 +205,149 @@ let gmPreset = { bank: 0, program: 0, name: 'Grand Piano' }
  *   在 Node 里重写一遍合成器，等于维护两套，导出的声音必然和听到的不一样。
  *   EXE 已经有 RenderToWav()，直接复用同一套 Voice/混音代码。
  */
+/**
+ * 播放列表。
+ *
+ * 用户选一个文件夹，里面所有 .mid 排成一列，播完一首自动下一首。
+ *
+ * 为什么放在 Node 而不是 EXE 里：
+ *   MIDI 解析（tempo map、Program Change、音域移调）全在 lib/midi.js，
+ *   而且已经调好了。在 C# 里重写一遍等于维护两套，
+ *   两边的解析结果迟早不一致 —— 同一首歌在网页和 EXE 里听起来不一样。
+ *   所以 EXE 只管"放什么、放完没"，解析交给这里。
+ *
+ * state 结构：
+ *   {
+ *     dir: string,          // 音乐目录（绝对路径）
+ *     files: string[],      // 目录里的 .mid 文件名（已排序）
+ *     index: number,        // 当前播到第几首（0 起）
+ *     mode: 'order' | 'one' | 'shuffle',
+ *     playing: boolean,     // 是否在播（暂停时 false）
+ *     startedAt: number,    // 当前这首的开始时刻（Date.now）
+ *     seconds: number,      // 当前这首多长
+ *   }
+ */
+const playlist = {
+  dir: '',
+  files: [],
+  index: -1,
+  mode: 'order',
+  playing: false,
+  startedAt: 0,
+  seconds: 0,
+}
+
+/** 支持的扩展名。.mid 是标准，.midi 偶尔有。 */
+const MIDI_EXT = /\.(mid|midi)$/i
+
+/**
+ * 扫描一个目录里的 MIDI 文件。
+ *
+ * 只扫一层，不递归 —— 递归会把 "备份" 之类的子目录也扫进来，
+ * 同一首歌出现两次，切歌时莫名其妙重复。
+ *
+ * @param {string} dir
+ * @returns {{ dir: string, files: string[] }}
+ */
+function scanMidiDir(dir) {
+  const abs = isAbsolute(dir) ? dir : resolve(dir)
+  if (!existsSync(abs)) {
+    throw new NoteError(`找不到这个目录：${abs}`)
+  }
+  let st
+  try { st = statSync(abs) } catch (e) {
+    throw new NoteError(`打不开这个目录：${abs}（${e.message}）`)
+  }
+  if (!st.isDirectory()) {
+    throw new NoteError(`这不是文件夹：${abs}`)
+  }
+  const files = readdirSync(abs)
+    .filter((f) => MIDI_EXT.test(f))
+    .sort((a, b) => a.localeCompare(b, 'zh-CN'))
+  return { dir: abs, files }
+}
+
+/**
+ * 播播放列表里的第 index 首。
+ *
+ * 和 /upload-midi 的区别：那个是"用户传一个文件进来播一次"，
+ * 这个是"从已扫描的列表里挑一首，并且记住位置"。
+ *
+ * 解析失败的处理很关键：一首坏文件不能卡住整个列表 ——
+ * 自动跳到下一首（最多试 files.length 次，防止全是坏文件时死循环）。
+ *
+ * @param {object} engine
+ * @param {number} index
+ * @param {{ auto?: boolean }} [opts] auto=true 表示是"播完了自动切"，不是用户点的
+ * @returns {{ ok: boolean, index?: number, file?: string, seconds?: number, error?: string }}
+ */
+function playPlaylistAt(engine, index, opts = {}) {
+  const n = playlist.files.length
+  if (!n) return { ok: false, error: '播放列表是空的，先选一个文件夹。' }
+
+  // 循环回绕
+  let i = ((index % n) + n) % n
+
+  for (let tries = 0; tries < n; tries++) {
+    const file = playlist.files[i]
+    const full = join(playlist.dir, file)
+    try {
+      const buf = readFileSync(full)
+      if (buf.length < 14 || buf.slice(0, 4).toString('ascii') !== 'MThd') {
+        throw new Error('不是标准 MIDI 文件')
+      }
+      const midi = parseMidi(buf)
+      const { timeline, seconds } = midiToTimeline(midi)
+      if (!timeline.length) throw new Error('没有能播的音符')
+
+      const bpm = midi.tempoMap?.length
+        ? Math.round(60_000_000 / midi.tempoMap[0].usPerQuarter)
+        : null
+      const score = {
+        topic: 'midi',
+        file,
+        bpm,
+        key: midi.keySignature || null,
+        timeSig: midi.timeSignature || null,
+        transpose: 0,
+        playlist: true,
+        track: i + 1,
+        total: n,
+      }
+
+      engine.stop()
+      ensureWindowModule(hostOrigin)
+      engine.schedule(timeline, { label: file.replace(MIDI_EXT, ''), tempo: null, score })
+
+      playlist.index = i
+      playlist.playing = true
+      playlist.startedAt = Date.now()
+      playlist.seconds = seconds
+
+      return { ok: true, index: i, file, seconds, notes: timeline.length }
+    } catch (error) {
+      winLog(`playlist: 第 ${i + 1} 首「${file}」打不开（${error?.message || error}），跳过`)
+      i = (i + 1) % n
+    }
+  }
+
+  return { ok: false, error: `${n} 首全都打不开，检查一下文件夹里的文件。` }
+}
+
+/** 下一个索引（按当前模式算）。 */
+function nextIndex(step) {
+  const n = playlist.files.length
+  if (!n) return 0
+  if (playlist.mode === 'one' && step > 0) return playlist.index   // 单曲循环
+  if (playlist.mode === 'shuffle') {
+    if (n === 1) return 0
+    let r = playlist.index
+    while (r === playlist.index) r = Math.floor(Math.random() * n)
+    return r
+  }
+  return ((playlist.index + step) % n + n) % n
+}
+
 let renderJob = null   // { id, out, timeline, startedAt }
 
 /**
@@ -1226,6 +1369,116 @@ async function handle(req, res, engine, playText, origin) {
 
   // 上传一个 MIDI 文件并直接播放。body 是裸二进制 .mid。
   // 参数：name=<文件名>（只用于显示）、tempo=<倍率>
+  // ───────── 播放列表 ─────────
+  //
+  // EXE 那边有一排按钮：选文件夹 / 上一首 / 下一首 / 播放模式。
+  // 这里提供它们要的数据和动作。
+
+  /**
+   * 选目录并扫描。参数：dir=<绝对路径>
+   *
+   * 扫完不自动播 —— 用户点了"打开文件夹"只是想看看里面有啥，
+   * 立刻出声会很吵。要播就再点一次播放。
+   */
+  if (method === 'POST' && path === '/playlist/open') {
+    const q = url.searchParams
+    let dir = String(q.get('dir') || '').trim()
+    // 打开文件夹对话框：EXE 那边用 .NET 的 FolderBrowserDialog 拿路径，
+    // 拿不到时（比如权限）退回这里给的默认值。
+    if (!dir) dir = playlist.dir || ''
+    if (!dir) {
+      return sendJson(res, 400, { ok: false, error: '要给一个目录（dir=）。' })
+    }
+    try {
+      const { dir: abs, files } = scanMidiDir(dir)
+      playlist.dir = abs
+      playlist.files = files
+      playlist.index = files.length ? 0 : -1
+      playlist.playing = false
+      playlist.seconds = 0
+      winLog(`playlist: 打开 ${abs}，${files.length} 首`)
+      return sendJson(res, 200, { ok: true, dir: abs, count: files.length, files })
+    } catch (error) {
+      return sendJson(res, 400, { ok: false, error: String(error?.message ?? error) })
+    }
+  }
+
+  /** 当前状态。EXE 每秒来问一次，用来更新曲名和进度。 */
+  if (method === 'GET' && path === '/playlist/state') {
+    const n = playlist.files.length
+    const cur = playlist.index >= 0 && playlist.index < n ? playlist.files[playlist.index] : null
+    const elapsed = playlist.playing && playlist.startedAt
+      ? Math.min(playlist.seconds * 1000, Date.now() - playlist.startedAt)
+      : 0
+    return sendJson(res, 200, {
+      ok: true,
+      dir: playlist.dir,
+      count: n,
+      index: playlist.index,
+      file: cur,
+      name: cur ? cur.replace(MIDI_EXT, '') : '',
+      mode: playlist.mode,
+      playing: playlist.playing,
+      seconds: playlist.seconds,
+      elapsed: elapsed / 1000,
+      // 播完了没：给 EXE 判断"该下一首了"
+      finished: playlist.playing && playlist.seconds > 0
+        && (Date.now() - playlist.startedAt) >= playlist.seconds * 1000 + 1200,
+    })
+  }
+
+  /** 切歌。参数：dir=next|prev|N（N 是 0 起的绝对序号） */
+  if (method === 'POST' && path === '/playlist/goto') {
+    const q = url.searchParams
+    const raw = String(q.get('dir') || 'next').trim()
+    if (!playlist.files.length) {
+      return sendJson(res, 400, { ok: false, error: '播放列表是空的。' })
+    }
+    let target
+    if (raw === 'next') target = nextIndex(1)
+    else if (raw === 'prev') target = nextIndex(-1)
+    else {
+      const n = Number(raw)
+      if (!Number.isFinite(n)) {
+        return sendJson(res, 400, { ok: false, error: 'dir 只能是 next / prev / 数字。' })
+      }
+      target = Math.max(0, Math.min(playlist.files.length - 1, Math.round(n)))
+    }
+    const r = playPlaylistAt(engine, target, { auto: q.get('auto') === '1' })
+    if (!r.ok) return sendJson(res, 400, { ok: false, error: r.error })
+    return sendJson(res, 200, { ok: true, ...r, mode: playlist.mode })
+  }
+
+  /** 暂停 / 继续。EXE 的 ▶‖ 按钮走这里。 */
+  if (method === 'POST' && path === '/playlist/play') {
+    if (!playlist.files.length) {
+      return sendJson(res, 400, { ok: false, error: '播放列表是空的。' })
+    }
+    if (playlist.playing) {
+      // 暂停：停引擎，记住已经播了多少
+      playlist.elapsedSaved = Date.now() - playlist.startedAt
+      playlist.playing = false
+      engine.stop()
+      return sendJson(res, 200, { ok: true, playing: false })
+    }
+    // 继续：从头播当前这首（不做"从中间接着播"——
+    // 引擎是事件流，续播要重算偏移，容易出错，而且用户多数是想重听）
+    const r = playPlaylistAt(engine, playlist.index < 0 ? 0 : playlist.index)
+    if (!r.ok) return sendJson(res, 400, { ok: false, error: r.error })
+    return sendJson(res, 200, { ok: true, playing: true, ...r })
+  }
+
+  /** 切模式：order（顺序）/ one（单曲）/ shuffle（随机） */
+  if (method === 'POST' && path === '/playlist/mode') {
+    const raw = String(url.searchParams.get('mode') || '').trim()
+    if (!['order', 'one', 'shuffle'].includes(raw)) {
+      return sendJson(res, 400, { ok: false, error: 'mode 只能是 order / one / shuffle。' })
+    }
+    playlist.mode = raw
+    winLog('playlist: 模式 → ' + raw)
+    return sendJson(res, 200, { ok: true, mode: raw })
+  }
+
   if (method === 'POST' && path === '/upload-midi') {
     const buf = await readRawBody(req)
     if (!buf || buf.length < 14) {

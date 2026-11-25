@@ -559,45 +559,20 @@ html[data-dp-snap="1"] [data-dp-root]{z-index:50;}
        * 为什么加这个：128 个音色，翻下拉列表太费劲。
        * 用快捷键可以直接连着试听、快速找到想要的音色。
        *
-       * 只在"页面有焦点"时生效，且不抢占：
-       *   · 输入框/文本域里按 Ctrl+↑↓ 不拦（那是光标移动/滚动）
-       *   · 下拉打开时也拦（那时你就是在选乐器）
+       * Ctrl+↑↓ 换乐器的快捷键**不在这里**做了。
+       *
+       * 原因：网页这边只能在自己的标签页有焦点时收到键盘事件，
+       * 而用户在 DSH 里打字时焦点在输入框上，按 Ctrl+↑↓ 切不了乐器；
+       * 反过来切歌（Ctrl+←→）又做在 EXE 的全局钩子里，任何焦点都行。
+       * 两套规则各管一半，用起来非常分裂。
+       *
+       * 现在统一：Ctrl+←→ 切歌、Ctrl+↑↓ 换乐器，**全部由 EXE 的全局键盘钩子处理**，
+       * 不管焦点在 DSH 还是钢琴窗口都生效。这里只保留下拉框自己的键盘操作
+       * （打开时 ↑↓ 选条目、Enter 确认）。
+       *
+       * 网页要感知变化，靠 /preset 轮询 —— EXE 换了音色会写回宿主，
+       * 这里每秒问一次，自然就同步了。
        */
-      React.useEffect(() => {
-        const onKey = (ev) => {
-          if (!ev.ctrlKey || ev.altKey || ev.metaKey) return
-          if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return
-
-          // 输入框里不拦（聊天框里 Ctrl+↑ 有别的用途）
-          const t = ev.target
-          const tag = t && t.tagName ? t.tagName.toLowerCase() : ''
-          const typing = tag === 'input' || tag === 'textarea' || (t && t.isContentEditable)
-          // 例外：我们自己那个搜索框要放行（在下面拦，用来上下选）
-          const inSearch = t && t.hasAttribute && t.hasAttribute('data-dp-instsearch')
-          if (typing && !inSearch) return
-
-          ev.preventDefault()
-          ev.stopPropagation()
-
-          const step = ev.key === 'ArrowUp' ? -1 : 1
-          // 用 ref 读当前值，不在 setState 回调里发请求 ——
-          // 那样 React 严格模式会重复执行回调，等于连发两次请求。
-          const prev = curRef.current
-          const next = Math.max(0, Math.min(list.length - 1, prev + step))
-          if (next === prev) return
-
-          curRef.current = next
-          setCur(next)
-          lastUserPickRef.current = next
-          // 立刻发切换请求（不 await，键盘要跟手）
-          fetch(API + '/instrument?program=' + next, {
-            method: 'POST',
-            credentials: 'same-origin',
-          }).catch(() => {})
-        }
-        window.addEventListener('keydown', onKey, true)
-        return () => window.removeEventListener('keydown', onKey, true)
-      }, [list.length])
 
       if (!list.length) return null
 
