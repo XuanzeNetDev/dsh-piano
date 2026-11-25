@@ -235,6 +235,9 @@ const playlist = {
   playing: false,
   startedAt: 0,
   seconds: 0,
+  // 上次播到哪个文件（按名字记，不按索引 ——
+  // 用户往文件夹里加了新歌之后索引会错位，名字不会）
+  lastFile: '',
 }
 
 /** 支持的扩展名。.mid 是标准，.midi 偶尔有。 */
@@ -320,9 +323,11 @@ function playPlaylistAt(engine, index, opts = {}) {
       engine.schedule(timeline, { label: file.replace(MIDI_EXT, ''), tempo: null, score })
 
       playlist.index = i
+      playlist.lastFile = file          // 记住这首，下次启动从这儿继续
       playlist.playing = true
       playlist.startedAt = Date.now()
       playlist.seconds = seconds
+      savePlaylistState()               // 记下"播到这首了"
 
       return { ok: true, index: i, file, seconds, notes: timeline.length }
     } catch (error) {
@@ -346,6 +351,37 @@ function nextIndex(step) {
     return r
   }
   return ((playlist.index + step) % n + n) % n
+}
+
+/**
+ * 播放列表的持久位置。
+ *
+ * 存在插件自己的 record/playlist.json 里 —— 不去改 EXE 的 tools/settings.json，
+ * 那个文件 EXE 每次启动都会整体重写，两边同时写会互相覆盖。
+ */
+function playlistStatePath() {
+  return join(PKG_ROOT, 'record', 'playlist.json')
+}
+
+function loadPlaylistState() {
+  try {
+    const p = playlistStatePath()
+    if (!existsSync(p)) return null
+    const d = JSON.parse(readFileSync(p, 'utf8'))
+    return (d && typeof d.dir === 'string') ? d : null
+  } catch { return null }
+}
+
+function savePlaylistState() {
+  try {
+    const dir = dirname(playlistStatePath())
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    writeFileSync(playlistStatePath(), JSON.stringify({
+      dir: playlist.dir,
+      file: playlist.lastFile,
+      mode: playlist.mode,
+    }), 'utf8')
+  } catch { /* 存不了就算了，不影响播放 */ }
 }
 
 let renderJob = null   // { id, out, timeline, startedAt }
@@ -1391,13 +1427,30 @@ async function handle(req, res, engine, playText, origin) {
     }
     try {
       const { dir: abs, files } = scanMidiDir(dir)
+
+      // 换目录就重置；同一个目录则找回上次播到的那首。
+      const sameDir = (abs === playlist.dir)
+      const keepFile = sameDir ? playlist.lastFile : ''
+
       playlist.dir = abs
       playlist.files = files
-      playlist.index = files.length ? 0 : -1
       playlist.playing = false
       playlist.seconds = 0
-      winLog(`playlist: 打开 ${abs}，${files.length} 首`)
-      return sendJson(res, 200, { ok: true, dir: abs, count: files.length, files })
+
+      // 找上次那首：先按文件名精确匹配。
+      // 找不到（文件被删/改名）就退回第 0 首。
+      let resume = -1
+      if (keepFile) resume = files.indexOf(keepFile)
+      playlist.index = files.length ? (resume >= 0 ? resume : 0) : -1
+      playlist.lastFile = playlist.index >= 0 ? files[playlist.index] : ''
+
+      savePlaylistState()
+      winLog(`playlist: 打开 ${abs}，${files.length} 首`
+             + (resume >= 0 ? `，从上次的「${keepFile}」（第 ${resume + 1} 首）继续` : ''))
+      return sendJson(res, 200, {
+        ok: true, dir: abs, count: files.length, files,
+        index: playlist.index, resume: resume >= 0,
+      })
     } catch (error) {
       return sendJson(res, 400, { ok: false, error: String(error?.message ?? error) })
     }
@@ -1405,6 +1458,26 @@ async function handle(req, res, engine, playText, origin) {
 
   /** 当前状态。EXE 每秒来问一次，用来更新曲名和进度。 */
   if (method === 'GET' && path === '/playlist/state') {
+    // 首次被问（EXE 刚起来）→ 自动恢复上次的目录和曲目。
+    // 放在这里而不是启动时，是因为"用哪个目录"要等用户实际用的时候才知道，
+    // 而且 DSH 重启后 playlist 是空的，这次请求就是最好的恢复时机。
+    if (!playlist.files.length) {
+      const saved = loadPlaylistState()
+      if (saved && saved.dir && existsSync(saved.dir)) {
+        try {
+          const { dir: abs, files } = scanMidiDir(saved.dir)
+          playlist.dir = abs
+          playlist.files = files
+          playlist.mode = ['order', 'one', 'shuffle'].includes(saved.mode) ? saved.mode : 'order'
+          const resume = saved.file ? files.indexOf(saved.file) : -1
+          playlist.index = files.length ? (resume >= 0 ? resume : 0) : -1
+          playlist.lastFile = playlist.index >= 0 ? files[playlist.index] : ''
+          winLog(`playlist: 恢复 ${abs}，${files.length} 首`
+                 + (resume >= 0 ? `，从「${saved.file}」（第 ${resume + 1} 首）` : ''))
+        } catch { /* 目录没了就当没存过 */ }
+      }
+    }
+
     const n = playlist.files.length
     const cur = playlist.index >= 0 && playlist.index < n ? playlist.files[playlist.index] : null
     const elapsed = playlist.playing && playlist.startedAt
@@ -1475,6 +1548,7 @@ async function handle(req, res, engine, playText, origin) {
       return sendJson(res, 400, { ok: false, error: 'mode 只能是 order / one / shuffle。' })
     }
     playlist.mode = raw
+    savePlaylistState()
     winLog('playlist: 模式 → ' + raw)
     return sendJson(res, 200, { ok: true, mode: raw })
   }

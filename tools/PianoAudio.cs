@@ -129,6 +129,7 @@ namespace DshPiano
             var output = new short[totalFrames];
             var mix = new float[FRAMES];
             double dcIn = 0, dcOut = 0, dcInPrev = 0, dcOutPrev = 0;
+            double limGain = 1.0;   // 限幅器当前增益（1.0 = 不压缩）
             int nextNote = 0;
             long frame = 0;
 
@@ -162,7 +163,8 @@ namespace DshPiano
                         dcOut = DcCoef * (dcOutPrev + dcIn - dcInPrev);
                         dcInPrev = dcIn;
                         dcOutPrev = dcOut;
-                        double x = Math.Tanh(dcOut);
+                        double limitedR = LimitGain(dcOut, ref limGain);
+                        double x = Math.Tanh(limitedR);
                         output[frame + k] = (short)(x * 32000);
                     }
                     frame += n2;
@@ -324,6 +326,36 @@ namespace DshPiano
         static readonly double HpCoef2 = HpCoef;
         /// <summary>输出前的直流隔断（10Hz），防止任何偏置直接进扬声器。</summary>
         static readonly double DcCoef = (1.0 / (2.0 * Math.PI * 10.0)) / (1.0 / (2.0 * Math.PI * 10.0) + 1.0 / SR);
+        /// <summary>
+        /// 峰值限幅：把超过阈值的部分压下来，但不让波形"撞墙"。
+        ///
+        /// 为什么必须有：混音是**不加限制地累加**的 —— 几百上千个声部同时响时，
+        /// 混音值能到几十。原来的处理是 Math.Tanh(x)，它在 |x|>3 之后基本是常数，
+        /// 波形被压成方波 —— 那就是"爆音"（刺耳的咔哒声）。
+        ///
+        /// 做法（瞬时压 + 平滑释放）：
+        ///   · 超过阈值 → 立刻压到阈值（宁可短暂失真也不要破音）
+        ///   · 低于阈值 → 200ms 时间常数慢慢恢复（避免"抽气"感）
+        ///
+        /// 阈值 0.92：留 8% 余量给 Tanh 的软膝，实际碰不到硬削。
+        /// </summary>
+        static double LimitGain(double sample, ref double gain)
+        {
+            const double THRESH = 0.92;
+            double a = sample < 0 ? -sample : sample;
+            if (a > THRESH)
+            {
+                double need = THRESH / a;
+                if (need < gain) gain = need;
+            }
+            else
+            {
+                gain += (1.0 - gain) * 1.13e-4;   // SR=44100, 200ms
+                if (gain > 1.0) gain = 1.0;
+            }
+            return sample * gain;
+        }
+
 
         const int WHDR_DONE = 0x00000001;
         const int WAVE_MAPPER = -1;
@@ -546,6 +578,13 @@ namespace DshPiano
 
             lock (gate)
             {
+                // 复音上限：这条路径原来**完全没有**这道闸门 ——
+                // MAX_VOICES 只写在 PlaySample()（GM 音色）里，
+                // 钢琴走的是这里，于是同时能叠任意多个声部。
+                // 实测日志里出现过 voices=2228：2228 个声部一起混，
+                // 混音值远超 1.0，Tanh 压成方波 —— 那就是"爆音"。
+                while (voices.Count >= MAX_VOICES) voices.RemoveAt(0);
+
                 voices.Add(new Voice
                 {
                     Data = data,
@@ -765,7 +804,8 @@ namespace DshPiano
             var fmtSize = Marshal.SizeOf(typeof(WAVEHDR));
             var bufs = new byte[NBUF][];
             var mix = new float[FRAMES];
-            double dcIn = 0, dcOut = 0, dcInPrev = 0, dcOutPrev = 0;   // 输出前直流隔断的状态
+            double dcIn = 0, dcOut = 0, dcInPrev = 0, dcOutPrev = 0;
+            double limGain = 1.0;   // 限幅器当前增益（1.0 = 不压缩）   // 输出前直流隔断的状态
 
             // WAVEHDR 必须放在**非托管内存**里。
             // 托管数组里的结构体，驱动写回的是它自己固定的那份副本，
@@ -831,7 +871,8 @@ namespace DshPiano
                     dcOut = DcCoef * (dcOutPrev + dcIn - dcInPrev);
                     dcInPrev = dcIn;
                     dcOutPrev = dcOut;
-                    double x = Math.Tanh(dcOut);
+                    double limited = LimitGain(dcOut, ref limGain);
+                    double x = Math.Tanh(limited);
                     short sv = (short)(x * 32000);
                     buf[n * 2] = (byte)(sv & 0xFF);
                     buf[n * 2 + 1] = (byte)((sv >> 8) & 0xFF);
